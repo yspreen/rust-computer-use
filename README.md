@@ -1,15 +1,36 @@
 # Rust Computer Use
 
-Clean-room Rust MCP stdio server with the same tool interface as OpenAI's Codex
-Computer Use (`list_apps`, `get_app_state`, `click`, `drag`,
-`perform_secondary_action`, `press_key`, `scroll`, `select_text`, `set_value`,
-`type_text`). The target app is never activated. Input goes to its process and
-window, so your frontmost app, cursor and keyboard focus stay put.
+## Install
+
+Apple silicon, macOS 14.4 or later. Download the latest release and register it with your MCP client:
+
+```sh
+gh release download v0.0.1 -R yspreen/rust-computer-use
+shasum -a 256 -c rust-computer-use-v0.0.1-aarch64-apple-darwin.tar.gz.sha256
+tar -xzf rust-computer-use-v0.0.1-aarch64-apple-darwin.tar.gz
+xattr -c rust-computer-use-v0.0.1-aarch64-apple-darwin/rust-computer-use
+claude mcp add computer-use -- "$PWD/rust-computer-use-v0.0.1-aarch64-apple-darwin/rust-computer-use"
+```
+
+The binary is ad-hoc signed, not notarized. A browser download gets a quarantine flag
+that stops it from running. The `xattr` line clears it, and does nothing if the flag
+isn't there. Releases are listed on the
+[releases page](https://github.com/yspreen/rust-computer-use/releases).
+
+To build from source instead:
 
 ```sh
 cargo build --release
 claude mcp add computer-use -- "$PWD/target/release/rust-computer-use"
 ```
+
+## What it is
+
+Clean-room Rust MCP stdio server with the same tool interface as OpenAI's Codex
+Computer Use (`list_apps`, `get_app_state`, `click`, `drag`,
+`perform_secondary_action`, `press_key`, `scroll`, `select_text`, `set_value`,
+`type_text`). The target app is never activated. Input goes to its process and
+window, so your frontmost app, cursor and keyboard focus stay put.
 
 It needs Accessibility and Screen Recording. macOS grants both to the app that
 launches it (your terminal, editor or agent app), not to this binary. On the first

@@ -1,6 +1,6 @@
 [package]
 name = "rust-computer-use"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2021"
 description = "Clean-room Rust MCP server compatible with the Codex Computer Use tool interface"
 
@@ -13,3 +13,11 @@ objc2 = "0.6"
 objc2-app-kit = "0.3"
 objc2-foundation = "0.3"
 serde_json = "1"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+strip = true
+# A panic on the MCP thread should end the process, not leave AppKit running without it.
+panic = "abort"

@@ -5,23 +5,26 @@
 Apple silicon, macOS 14.4 or later. Download the latest release and register it with your MCP client:
 
 ```sh
-gh release download v0.0.1 -R yspreen/rust-computer-use
-shasum -a 256 -c rust-computer-use-v0.0.1-aarch64-apple-darwin.tar.gz.sha256
-tar -xzf rust-computer-use-v0.0.1-aarch64-apple-darwin.tar.gz
-xattr -c rust-computer-use-v0.0.1-aarch64-apple-darwin/rust-computer-use
-claude mcp add computer-use -- "$PWD/rust-computer-use-v0.0.1-aarch64-apple-darwin/rust-computer-use"
+base=https://github.com/yspreen/rust-computer-use/releases/latest/download
+curl -fLO "$base/rust-computer-use-aarch64-apple-darwin.tar.gz"
+curl -fLO "$base/rust-computer-use-aarch64-apple-darwin.tar.gz.sha256"
+shasum -a 256 -c rust-computer-use-aarch64-apple-darwin.tar.gz.sha256
+tar -xzf rust-computer-use-aarch64-apple-darwin.tar.gz
+xattr -c rust-computer-use-aarch64-apple-darwin/rust-computer-use
+claude mcp add rust-computer-use -- "$PWD/rust-computer-use-aarch64-apple-darwin/rust-computer-use"
 ```
 
 The binary is ad-hoc signed, not notarized. A browser download gets a quarantine flag
 that stops it from running. The `xattr` line clears it, and does nothing if the flag
-isn't there. Releases are listed on the
+isn't there. Claude Code reserves the name `computer-use`, so register it under another name.
+Releases are listed on the
 [releases page](https://github.com/yspreen/rust-computer-use/releases).
 
 To build from source instead:
 
 ```sh
 cargo build --release
-claude mcp add computer-use -- "$PWD/target/release/rust-computer-use"
+claude mcp add rust-computer-use -- "$PWD/target/release/rust-computer-use"
 ```
 
 ## What it is

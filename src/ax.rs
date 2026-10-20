@@ -24,7 +24,6 @@ const STANDARD_ACTIONS: &[(&str, &str)] = &[
 
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
-    fn AXIsProcessTrusted() -> bool;
     fn AXUIElementCreateApplication(pid: i32) -> AXRef;
     fn AXUIElementCopyAttributeValue(e: AXRef, a: CFStringRef, v: *mut CFTypeRef) -> i32;
     fn AXUIElementSetAttributeValue(e: AXRef, a: CFStringRef, v: CFTypeRef) -> i32;
@@ -100,10 +99,6 @@ pub fn to_string(v: CFTypeRef) -> Option<String> {
             None
         }
     }
-}
-
-pub fn trusted() -> bool {
-    unsafe { AXIsProcessTrusted() }
 }
 
 pub fn app_element(pid: i32) -> Cf {

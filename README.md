@@ -11,9 +11,13 @@ cargo build --release
 claude mcp add computer-use -- "$PWD/target/release/rust-computer-use"
 ```
 
-The process that launches it needs Accessibility and Screen Recording permission.
-On the first call without them, it opens the system prompts and asks the agent
-to retry. It sends no Apple Events, so you won't get per-app Automation prompts.
+It needs Accessibility and Screen Recording. macOS grants both to the app that
+launches it (your terminal, editor or agent app), not to this binary. On the first
+call without them, a setup window opens and lists both permissions. Allow opens the
+right System Settings pane, and a tile with the host app's icon docks under that
+window. Drag the tile into the list and switch it on. Run
+`rust-computer-use --setup` to open the window yourself. It sends no Apple Events,
+so you won't get per-app Automation prompts.
 
 ## Safety
 

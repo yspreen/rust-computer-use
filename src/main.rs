@@ -3,6 +3,7 @@ mod apps;
 mod ax;
 mod input;
 mod overlay;
+mod setup;
 mod text;
 
 use ax::Cf;
@@ -27,13 +28,7 @@ struct Snapshot {
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGWindowListCopyWindowInfo(option: u32, relative_to: u32) -> CFArrayRef;
-    fn CGPreflightScreenCaptureAccess() -> bool;
-    fn CGRequestScreenCaptureAccess() -> bool;
     fn CGSessionCopyCurrentDictionary() -> *const std::ffi::c_void;
-}
-#[link(name = "ApplicationServices", kind = "framework")]
-extern "C" {
-    fn AXIsProcessTrustedWithOptions(options: *const std::ffi::c_void) -> bool;
 }
 
 /// JSON-RPC over stdio. Server-initiated requests (elicitation) wait for their reply and
@@ -84,6 +79,15 @@ fn approvals_path() -> std::path::PathBuf {
 
 fn main() {
     input::warm(); // keyboard layout lookups must happen on the main thread
+    if std::env::args().any(|a| a == "--setup") {
+        // Just the permission walkthrough; the process ends when its window closes.
+        overlay::run(|| {
+            setup::show(true);
+            loop {
+                std::thread::park();
+            }
+        })
+    }
     overlay::run(serve)
 }
 
@@ -200,23 +204,15 @@ fn validate(name: &str, a: &Value) -> Result<(), String> {
     Ok(())
 }
 
-/// Accessibility and Screen Recording, prompting for them the first time they are missing.
+/// Accessibility and Screen Recording. When either is missing, the setup panel opens to walk
+/// the user through granting them.
 fn permissions() -> Result<(), String> {
-    if ax::trusted() && unsafe { CGPreflightScreenCaptureAccess() } {
+    if setup::all_granted() {
         return Ok(());
     }
-    static ASKED: std::sync::Once = std::sync::Once::new();
-    ASKED.call_once(|| unsafe {
-        let (k, v) = (ax::cfstr("AXTrustedCheckOptionPrompt"), core_foundation_sys::number::kCFBooleanTrue);
-        let opts = core_foundation_sys::dictionary::CFDictionaryCreate(
-            std::ptr::null(), &(k.0 as *const _), &(v as *const _), 1,
-            &core_foundation_sys::dictionary::kCFTypeDictionaryKeyCallBacks,
-            &core_foundation_sys::dictionary::kCFTypeDictionaryValueCallBacks,
-        );
-        AXIsProcessTrustedWithOptions(opts as _);
-        CGRequestScreenCaptureAccess();
-    });
-    Err("Computer Use permissions are not granted. The user needs to grant Accessibility and Screen Recording to the app running Rust Computer Use in System Settings > Privacy & Security. Call this tool again once they have.".into())
+    setup::show(false);
+    let host = setup::host().0;
+    Err(format!("Computer Use permissions are not granted. A setup window is open on the Mac: the user needs to allow Accessibility and Screen Recording for {host} there. Call this tool again once they have."))
 }
 
 fn screen_locked() -> bool {
@@ -509,10 +505,10 @@ fn state(snaps: &mut HashMap<i32, Snapshot>, app: &apps::App, full: bool) -> Res
     Ok(Value::Array(content))
 }
 
-/// CGWindowID of the app's window closest to the AX window frame.
-fn window_id(pid: i32, frame: (f64, f64, f64, f64)) -> Option<u32> {
-    // All windows, not just on-screen ones: hidden apps and other Spaces still capture.
-    let list = Cf(unsafe { CGWindowListCopyWindowInfo(16, 0) } as _);
+/// The app's normal (layer 0) windows as (window number, CG bounds x, y, w, h).
+/// `on_screen` leaves out hidden windows and other Spaces.
+pub fn windows(pid: i32, on_screen: bool) -> Vec<(u32, (f64, f64, f64, f64))> {
+    let list = Cf(unsafe { CGWindowListCopyWindowInfo(if on_screen { 1 | 16 } else { 16 }, 0) } as _);
     let num = |d: *const std::ffi::c_void, k: &str| {
         let v = unsafe { CFDictionaryGetValue(d as _, ax::cfstr(k).0) };
         let mut f = f64::NAN;
@@ -524,15 +520,19 @@ fn window_id(pid: i32, frame: (f64, f64, f64, f64)) -> Option<u32> {
     (0..unsafe { CFArrayGetCount(list.0 as _) })
         .map(|i| unsafe { CFArrayGetValueAtIndex(list.0 as _, i) })
         .filter(|&d| num(d, "kCGWindowOwnerPID") as i32 == pid && num(d, "kCGWindowLayer") == 0.0)
-        .min_by_key(|&d| {
+        .map(|d| {
             let b = unsafe { CFDictionaryGetValue(d as _, ax::cfstr("kCGWindowBounds").0) };
-            let dist = [("X", frame.0), ("Y", frame.1), ("Width", frame.2), ("Height", frame.3)]
-                .iter()
-                .map(|(k, v)| (num(b, k) - v).abs())
-                .sum::<f64>();
-            dist as i64
+            let bounds = (num(b, "X"), num(b, "Y"), num(b, "Width"), num(b, "Height"));
+            (num(d, "kCGWindowNumber") as u32, bounds)
         })
-        .map(|d| num(d, "kCGWindowNumber") as u32)
+        .collect()
+}
+
+/// CGWindowID of the app's window closest to the AX window frame. All windows count, so
+/// hidden apps and other Spaces still capture.
+fn window_id(pid: i32, frame: (f64, f64, f64, f64)) -> Option<u32> {
+    let dist = |(x, y, w, h): (f64, f64, f64, f64)| ((x - frame.0).abs() + (y - frame.1).abs() + (w - frame.2).abs() + (h - frame.3).abs()) as i64;
+    windows(pid, false).into_iter().min_by_key(|w| dist(w.1)).map(|w| w.0)
 }
 
 /// Full-resolution JPEG of one window, as the original sends it.

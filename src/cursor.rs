@@ -1,5 +1,6 @@
 //! The agent's on-screen cursor, rebuilt from the original's ComputerUseCursor: a 126x126
-//! click-through window holding a small arrow with a soft fog halo. Long moves follow the
+//! click-through window holding a dark rounded arrow with a white rim, a thin blue outer line
+//! and a soft shadow. Long moves follow the
 //! best of 20 candidate Bézier paths, driven by a spring; short ones "scoot" with
 //! stretch, squash and tilt. All motion and drawing runs on the main thread.
 use crate::input::Pt;
@@ -292,7 +293,7 @@ struct Cursor {
 thread_local! {
     static CURSOR: RefCell<Option<Cursor>> = const { RefCell::new(None) };
     /// What drawRect reads: hotspot-relative transform inputs.
-    static LOOK: RefCell<Look> = const { RefCell::new(Look { angle: 0.0, scale: 0.75, axis: 0.0, x_scale: 1.0, y_scale: 1.0, pivot: 0.5, tilt: 0.0 }) };
+    static LOOK: RefCell<Look> = const { RefCell::new(Look { angle: 0.0, scale: 1.0, axis: 0.0, x_scale: 1.0, y_scale: 1.0, pivot: 0.5, tilt: 0.0 }) };
 }
 
 #[derive(Clone, Copy)]
@@ -306,9 +307,10 @@ struct Look {
     tilt: f64,
 }
 
-/// The original's AgentCursor shape in unit coordinates (y down): move, then
-/// (curve end, control 1, control 2) or a line end.
-const ARROW: [(V, Option<(V, V)>); 8] = [
+/// The arrow's outline (the original's AgentCursor shape, unit square, y down): a start
+/// point, then (end, control 1, control 2) curves or line ends.
+const ARROW_START: V = V(0.00599, 0.15864);
+const ARROW: [(V, Option<(V, V)>); 7] = [
     (V(0.15158, 0.00627), Some((V(-0.02364, 0.06456), V(0.06169, -0.02474)))),
     (V(0.87634, 0.25652), None),
     (V(0.88794, 0.48095), Some((V(0.97594, 0.29096), V(0.9834, 0.43547)))),
@@ -316,12 +318,12 @@ const ARROW: [(V, Option<(V, V)>); 8] = [
     (V(0.45955, 0.92925), None),
     (V(0.2451, 0.91717), Some((V(0.41611, 1.02925), V(0.27801, 1.02146)))),
     (V(0.00599, 0.15864), None),
-    (V(0.00599, 0.15864), None),
 ];
-const ARROW_START: V = V(0.00599, 0.15864);
-/// The arrow is an 18 pt shape rotating about this point, which sits on the click point.
-const ARROW_SIZE: f64 = 18.0;
-const ANCHOR: V = V(0.40556, 0.45);
+/// 15 pt across, the rounded tip on the click point.
+const ARROW_SIZE: f64 = 15.0;
+const TIP: V = V(0.03, 0.03);
+/// The shadow's center, inside the arrow's body (shape points, y up).
+const BODY: V = V(6.0, -6.0);
 
 define_class!(
     #[unsafe(super(NSView))]
@@ -337,10 +339,15 @@ define_class!(
     }
 );
 
-/// Map a unit-space arrow point into view coordinates (y up, origin bottom-left).
-fn place(look: &Look, q: V) -> V {
-    let local = V((q.0 - ANCHOR.0) * ARROW_SIZE, (ANCHOR.1 - q.1) * ARROW_SIZE) * look.scale;
-    let turned = local.rot(-(look.angle + look.tilt));
+/// Unit outline point to shape points: tip at the origin, y up.
+fn shape(q: V) -> V {
+    V((q.0 - TIP.0) * ARROW_SIZE, (TIP.1 - q.1) * ARROW_SIZE)
+}
+
+/// Shape point to view coordinates (y up, origin bottom-left): press scale, heading and
+/// tilt about the tip, then the scoot stretch.
+fn place(look: &Look, p: V) -> V {
+    let turned = (p * look.scale).rot(-(look.angle + look.tilt));
     // Scoot: stretch along the travel axis and squash across it, about the pivot end.
     let axis = look.axis.to_radians();
     let a = turned.rot(-axis);
@@ -349,37 +356,43 @@ fn place(look: &Look, q: V) -> V {
     stretched.rot(axis) + V(HOTSPOT, SIZE - HOTSPOT)
 }
 
+/// The "halo ring" cursor: a dark rounded arrow with a white rim and a thin blue outer line,
+/// over a soft shadow.
 fn draw(look: Look) {
     let pt = |v: V| NSPoint::new(v.0, v.1);
-    // The fog halo. The original's is mostly a blurred copy of the backdrop, so on screen it
-    // reads as a faint shadow: a Gaussian (sigma 12.8 pt) around the click point at its
-    // dynamicShadowOpacity-scale strength, gone by 38 pt.
-    let stops: Vec<Retained<NSColor>> = (0..=12)
+    let rgb = |r: f64, g: f64, b: f64, a: f64| NSColor::colorWithSRGBRed_green_blue_alpha(r / 255.0, g / 255.0, b / 255.0, a);
+    // Shadow: a black Gaussian (sigma 10 pt, peak alpha 0.2) out to 3 sigma.
+    let stops: Vec<Retained<NSColor>> = (0..=16)
         .map(|i| {
-            let r = i as f64 / 12.0 * 38.0;
-            NSColor::colorWithWhite_alpha(0.0, 0.18 * (-r * r / (2.0 * 12.8 * 12.8)).exp())
+            let r = i as f64 / 16.0 * 30.0;
+            rgb(0.0, 0.0, 0.0, 0.2 * (-r * r / 200.0).exp())
         })
         .collect();
     let refs: Vec<&NSColor> = stops.iter().map(|c| &**c).collect();
     if let Some(g) = NSGradient::initWithColors(NSGradient::alloc(), &objc2_foundation::NSArray::from_slice(&refs)) {
-        let c = pt(V(HOTSPOT, SIZE - HOTSPOT));
-        g.drawFromCenter_radius_toCenter_radius_options(c, 0.0, c, 38.0, NSGradientDrawingOptions::empty());
+        let c = pt(place(&look, BODY));
+        g.drawFromCenter_radius_toCenter_radius_options(c, 0.0, c, 30.0, NSGradientDrawingOptions::empty());
     }
+    let at = |q: V| pt(place(&look, shape(q)));
     let path = NSBezierPath::bezierPath();
-    path.moveToPoint(pt(place(&look, ARROW_START)));
-    for (end, controls) in ARROW.iter().take(7) {
+    path.moveToPoint(at(ARROW_START));
+    for (end, controls) in ARROW {
         match controls {
-            Some((c1, c2)) => path.curveToPoint_controlPoint1_controlPoint2(pt(place(&look, *end)), pt(place(&look, *c1)), pt(place(&look, *c2))),
-            None => path.lineToPoint(pt(place(&look, *end))),
+            Some((c1, c2)) => path.curveToPoint_controlPoint1_controlPoint2(at(end), at(c1), at(c2)),
+            None => path.lineToPoint(at(end)),
         }
     }
     path.closePath();
-    // The original fills with a darkened blur of the backdrop; a dark gray reads the same.
-    NSColor::colorWithWhite_alpha(0.3, 1.0).setFill();
-    path.fill();
-    path.setLineWidth(2.0 * look.scale);
     path.setLineJoinStyle(NSLineJoinStyle::Round);
-    NSColor::colorWithWhite_alpha(1.0, 0.85).setStroke();
+    path.setLineCapStyle(NSLineCapStyle::Round);
+    // Blue line first and twice the rim's width, so 1.2 pt of it shows outside the rim.
+    rgb(47.0, 123.0, 255.0, 1.0).setStroke();
+    path.setLineWidth(4.0);
+    path.stroke();
+    rgb(38.0, 42.0, 52.0, 1.0).setFill();
+    path.fill();
+    rgb(255.0, 255.0, 255.0, 0.92).setStroke();
+    path.setLineWidth(1.6);
     path.stroke();
 }
 
@@ -541,7 +554,7 @@ impl Cursor {
         LOOK.with(|l| {
             *l.borrow_mut() = Look {
                 angle: self.angle.x,
-                scale: 0.75 * press,
+                scale: press,
                 axis: self.axis,
                 x_scale: self.x_scale,
                 y_scale: self.y_scale,
@@ -723,7 +736,7 @@ fn set_pressed(on: bool) {
     DispatchQueue::main().exec_async(move || {
         CURSOR.with(|c| {
             if let Some(c) = c.borrow_mut().as_mut() {
-                c.press.target = if on { 0.7 } else { 1.0 };
+                c.press.target = if on { 0.8 } else { 1.0 };
                 c.start_timer();
             }
         })

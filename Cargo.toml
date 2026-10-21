@@ -1,6 +1,6 @@
 [package]
 name = "rust-computer-use"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2021"
 description = "Clean-room Rust MCP server compatible with the Codex Computer Use tool interface"
 

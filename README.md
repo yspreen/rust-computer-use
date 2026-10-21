@@ -51,8 +51,9 @@ won't see a system prompt, and the app sends no Apple Events, so no "wants to
 control" Automation prompts either. Open the app from Finder, or run the binary
 with `--setup`, to bring the window up yourself.
 
-Grants are tied to the code signature. Builds signed ad hoc get a new one each
-time, so sign with a stable certificate (`CODESIGN_IDENTITY`) if you rebuild often.
+Grants are tied to the code signature. Releases from v0.0.4 on are all signed with
+the same certificate, so updating keeps them. Your own builds are signed ad hoc,
+which changes every build, unless you pass a certificate (`CODESIGN_IDENTITY`).
 
 ## The cursor
 

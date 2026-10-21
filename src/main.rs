@@ -495,7 +495,7 @@ const BROWSER_NOTES: &str = "## Browser Computer Use\n\nWhen navigating to a new
 /// Per-app guidance, assembled like the original: the browser note for any app that handles
 /// http URLs, then the first `<name>.md` found for the app's candidate names (Music's file is
 /// "AppleMusic", then CFBundleName, then the bundle id). Files come from
-/// `$RUST_COMPUTER_USE_INSTRUCTIONS`, else the Codex Computer Use app's bundled AppInstructions.
+/// The Codex Computer Use app's bundled AppInstructions.
 fn instructions(app: &apps::App) -> String {
     let bundle = objc2_foundation::NSBundle::bundleWithPath(&objc2_foundation::NSString::from_str(&app.path));
     let info = |k: &str| bundle.as_ref().and_then(|b| b.objectForInfoDictionaryKey(&objc2_foundation::NSString::from_str(k)));
@@ -507,7 +507,6 @@ fn instructions(app: &apps::App) -> String {
     names.push(app.bundle_id.clone());
     let home = std::env::var("HOME").unwrap_or_default();
     let dirs = [
-        std::env::var("RUST_COMPUTER_USE_INSTRUCTIONS").unwrap_or_default(),
         format!("{home}/.codex/computer-use/Codex Computer Use.app/Contents/Resources/Package_ComputerUse.bundle/Contents/Resources/AppInstructions"),
     ];
     let mut parts: Vec<String> = vec![];
@@ -515,7 +514,7 @@ fn instructions(app: &apps::App) -> String {
         parts.push(BROWSER_NOTES.into());
     }
     let file = names.iter().find_map(|n| {
-        dirs.iter().filter(|d| !d.is_empty()).find_map(|d| std::fs::read_to_string(format!("{d}/{n}.md")).ok()).filter(|t| !t.is_empty())
+        dirs.iter().find_map(|d| std::fs::read_to_string(format!("{d}/{n}.md")).ok()).filter(|t| !t.is_empty())
     });
     parts.extend(file);
     if parts.is_empty() {

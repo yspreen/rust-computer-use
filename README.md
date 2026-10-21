@@ -105,7 +105,7 @@ seconds. Your real pointer never moves.
   for windows on other Spaces too.
 - **App instructions:** the original's browser note for any app that handles
   http links. Per-app notes come from the Codex Computer Use app's bundled
-  AppInstructions if it is installed, or from `RUST_COMPUTER_USE_INSTRUCTIONS`.
+  AppInstructions if it is installed.
   Each is sent once per session.
 - **`app`** also accepts a pid, which picks one instance when several share a
   bundle ID.

@@ -2,7 +2,7 @@
 use crate::ax::Cf;
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicI32, AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::{AtomicI32, AtomicI64, AtomicU32, Ordering::Relaxed};
 use std::sync::{Mutex, OnceLock};
 use std::{thread::sleep, time::Duration};
 
@@ -30,7 +30,14 @@ extern "C" {
     fn CGEventSetLocation(e: Ev, p: Pt);
     fn CGEventSetWindowLocation(e: Ev, p: Pt);
     fn CGEventSetIntegerValueField(e: Ev, field: u32, v: i64);
+    fn CGEventSetDoubleValueField(e: Ev, field: u32, v: f64);
+    fn CGEventSetType(e: Ev, ty: u32);
     fn CGEventPostToPid(pid: i32, e: Ev);
+}
+
+#[link(name = "ApplicationServices", kind = "framework")]
+extern "C" {
+    fn AXValueGetValue(v: *const c_void, t: u32, out: *mut c_void) -> bool;
 }
 
 #[link(name = "Carbon", kind = "framework")]
@@ -50,33 +57,47 @@ extern "C" {
 static BELIEVERS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
 
 /// Make a background app believe it is the active app without activating it, as the
-/// original's focus enforcer does: an AppKit-defined ApplicationActivated event posted to the
-/// process. AppKit only honors key equivalents and modifier navigation (super+s,
-/// shift+alt+Left) in an app that believes it is active. Any other app told so earlier gets
-/// ApplicationDeactivated first.
-pub fn believe_active(pid: i32) {
+/// original's focus enforcer does before its first synthesized event: an AppKit-defined
+/// ApplicationActivated event for the window, then a press at the window's activation point
+/// (AppKit only honors key equivalents and modifier navigation such as super+s or
+/// shift+alt+Left in an app that believes it is active). Without an activation point only
+/// the bare event goes out. Any other app told so earlier gets ApplicationDeactivated first.
+pub fn believe_active(pid: i32, activation: Option<Pt>) {
     let mut b = BELIEVERS.lock().unwrap();
     if b.contains(&pid) {
         return;
     }
     for other in b.drain(..) {
-        post_app_event(other, 2);
+        post_app_event(other, 2, 0);
     }
-    post_app_event(pid, 1);
+    let window = WINDOW.load(Relaxed);
+    match activation.filter(|_| window != 0) {
+        Some(p) => {
+            post_app_event(pid, 1, window);
+            // Two separately numbered events here, unlike a click's down/up pair.
+            post(mouse(1, p, 0, next_number(), 1));
+            post(mouse(2, p, 0, next_number(), 1));
+        }
+        None => post_app_event(pid, 1, 0),
+    }
+    // Give AppKit a moment to take the activation before input arrives (the original's
+    // first key follows about 8 ms later).
+    pause(10);
     b.push(pid);
 }
 
 /// Undo believe_active for every app (at the end of the session).
 pub fn disbelieve_all() {
     for pid in BELIEVERS.lock().unwrap().drain(..) {
-        post_app_event(pid, 2);
+        post_app_event(pid, 2, 0);
     }
 }
 
-fn post_app_event(pid: i32, subtype: i16) {
+fn post_app_event(pid: i32, subtype: i16, window: u32) {
     use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType};
+    let flags = NSEventModifierFlags(if window == 0 { 0 } else { 0xc0000 });
     let ev = NSEvent::otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2(
-        NSEventType::AppKitDefined, objc2_foundation::NSPoint::ZERO, NSEventModifierFlags(0), 0.0, 0, None, subtype, 0, 0,
+        NSEventType::AppKitDefined, objc2_foundation::NSPoint::ZERO, flags, 0.0, window as isize, None, subtype, 0, 0,
     );
     if let Some(ev) = ev {
         let cg: *const c_void = unsafe { objc2::msg_send![&*ev, CGEvent] };
@@ -86,6 +107,13 @@ fn post_app_event(pid: i32, subtype: i16) {
     }
 }
 
+/// A point-valued AX attribute such as AXActivationPoint.
+pub fn ax_point(e: *const c_void, name: &str) -> Option<Pt> {
+    let v = crate::ax::attr(e, name)?;
+    let mut p = Pt { x: 0.0, y: 0.0 };
+    unsafe { AXValueGetValue(v.0, 1, &mut p as *mut Pt as _) }.then_some(p)
+}
+
 /// `origin` is the window's top-left corner in global points.
 pub fn target(pid: i32, window: u32, origin: Pt) {
     PID.store(pid, Relaxed);
@@ -93,17 +121,20 @@ pub fn target(pid: i32, window: u32, origin: Pt) {
     *ORIGIN.lock().unwrap() = origin;
 }
 
+/// Events go out back to back, as the original sends them; only presses keep a pace.
 fn post(e: Ev) {
     let e = Cf(e);
     unsafe { CGEventPostToPid(PID.load(Relaxed), e.0) };
-    sleep(Duration::from_millis(8));
 }
 
-/// Pointer events keep a human pace: SwiftUI drops presses whose down and up arrive within a
-/// few milliseconds. The original spaces them about 50-65 ms apart.
-fn post_mouse(e: Ev) {
-    post(e);
-    sleep(Duration::from_millis(45));
+fn pause(ms: u64) {
+    sleep(Duration::from_millis(ms));
+}
+
+/// Mouse event numbers run on one counter; an up reuses its down's number.
+fn next_number() -> i64 {
+    static N: AtomicI64 = AtomicI64::new(0);
+    N.fetch_add(1, Relaxed) + 1
 }
 
 /// Address a pointer event to the target window. AppKit drops pid-posted clicks on a
@@ -118,76 +149,115 @@ fn address(e: Ev, p: Pt) -> Ev {
     e
 }
 
-fn mouse(ty: u32, p: Pt, button: u32) -> Ev {
-    address(unsafe { CGEventCreateMouseEvent(std::ptr::null(), ty, p, button) }, p)
+/// A mouse event the way the original builds them: event number (field 0), click state (1),
+/// pressure 1.0 (2), button number (3) and mouse subtype 3 (7).
+fn mouse(ty: u32, p: Pt, button: u32, number: i64, clicks: i64) -> Ev {
+    let e = address(unsafe { CGEventCreateMouseEvent(std::ptr::null(), ty, p, button) }, p);
+    unsafe {
+        CGEventSetIntegerValueField(e, 0, number);
+        CGEventSetIntegerValueField(e, 1, clicks);
+        CGEventSetDoubleValueField(e, 2, 1.0);
+        CGEventSetIntegerValueField(e, 3, button as i64);
+        CGEventSetIntegerValueField(e, 7, 3);
+    }
+    e
 }
 
-pub fn click(p: Pt, button: &str, count: i64) {
+fn move_to(p: Pt) {
+    post(mouse(5, p, 0, next_number(), 1));
+}
+
+/// Click at `p`: each press is down, 50 ms (defaultClickDuration), up, 50 ms. `hover` sends a
+/// mouseMoved first and waits as the original does for coordinate clicks; element clicks
+/// skip it.
+pub fn click(p: Pt, button: &str, count: i64, hover: bool) {
     let (down, up, b) = match button {
         "right" => (3, 4, 1),
         "middle" => (25, 26, 2),
         _ => (1, 2, 0),
     };
-    post_mouse(mouse(5, p, 0));
+    if hover {
+        move_to(p);
+        pause(63);
+    }
     for n in 1..=count.max(1) {
-        for ty in [down, up] {
-            let e = mouse(ty, p, b);
-            unsafe { CGEventSetIntegerValueField(e, 1, n) }; // kCGMouseEventClickState
-            post_mouse(e);
-        }
+        let number = next_number();
+        post(mouse(down, p, b, number, n));
+        pause(50);
+        post(mouse(up, p, b, number, n));
+        pause(50);
     }
 }
 
+/// Press at `from`, three dragged events (start, midpoint, end), release at `to`.
 pub fn drag(from: Pt, to: Pt) {
-    post_mouse(mouse(1, from, 0));
-    for i in 1..=20 {
-        let t = i as f64 / 20.0;
-        post(mouse(6, Pt { x: from.x + (to.x - from.x) * t, y: from.y + (to.y - from.y) * t }, 0));
+    move_to(from);
+    pause(63);
+    let number = next_number();
+    post(mouse(1, from, 0, number, 1));
+    let dragged = next_number();
+    for t in [0.0, 0.5, 1.0] {
+        post(mouse(6, Pt { x: from.x + (to.x - from.x) * t, y: from.y + (to.y - from.y) * t }, 0, dragged, 0));
     }
-    post_mouse(mouse(2, to, 0));
+    post(mouse(2, to, 0, number, 1));
 }
 
-/// Scroll by points (positive = down / right). Pixel units avoid per-app line acceleration;
-/// small steps keep apps that clamp large deltas honest.
+/// Scroll by points (positive = down / right) with one continuous pixel scroll event after
+/// hovering the spot, as the original does.
 pub fn scroll(at: Pt, dy: i32, dx: i32) {
-    let steps = (dy.abs().max(dx.abs()) as f64 / 40.0).ceil().max(1.0) as i32;
-    let mut sent = (0, 0);
-    for i in 1..=steps {
-        let step = (dy * i / steps - sent.0, dx * i / steps - sent.1);
-        sent = (sent.0 + step.0, sent.1 + step.1);
-        let e = unsafe { CGEventCreateScrollWheelEvent2(std::ptr::null(), 0, 2, -step.0, -step.1, 0) };
-        unsafe { CGEventSetLocation(e, at) };
-        post(address(e, at));
+    move_to(at);
+    pause(20);
+    let e = unsafe { CGEventCreateScrollWheelEvent2(std::ptr::null(), 0, 2, -dy, -dx, 0) };
+    unsafe {
+        CGEventSetLocation(e, at);
+        CGEventSetIntegerValueField(e, 88, 1); // kCGScrollWheelEventIsContinuous
     }
+    post(address(e, at));
 }
 
+/// Type through key events, as the original does: each character on its layout key (with the
+/// shift/option/control it needs) and carrying the character itself. Characters no key
+/// produces go out as bare unicode events rather than being dropped.
 pub fn type_text(text: &str) {
-    for (i, line) in text.split('\n').enumerate() {
-        if i > 0 {
-            key_event(36, 0);
-        }
-        // One event per character: many apps read only the first unit of a multi-char event.
-        for ch in line.chars() {
-            if let Some(&(code, flags)) = layout().get(&ch) {
-                key_event(code, flags);
-                continue;
-            }
-            let mut buf = [0u16; 2];
-            let units = ch.encode_utf16(&mut buf);
-            for down in [true, false] {
-                let e = unsafe { CGEventCreateKeyboardEvent(std::ptr::null(), 0, down) };
-                unsafe { CGEventKeyboardSetUnicodeString(e, units.len(), units.as_ptr()) };
-                post(e);
-            }
-        }
+    for ch in text.chars() {
+        let mut buf = [0u16; 2];
+        let units = match ch {
+            '\n' => &['\r' as u16][..],
+            _ => &*ch.encode_utf16(&mut buf),
+        };
+        let (code, flags) = match ch {
+            '\n' => (36, 0),
+            '\t' => (48, 0),
+            _ => layout().get(&ch).copied().unwrap_or((0, 0)),
+        };
+        key_event(code, flags, Some(units));
     }
 }
 
-fn key_event(code: u16, flags: u64) {
+/// Key down and up. Modifiers go out as flagsChanged events around the key, as the original
+/// sends them.
+fn key_event(code: u16, flags: u64, text: Option<&[u16]>) {
+    let flags_changed = |f: u64| {
+        let e = unsafe { CGEventCreateKeyboardEvent(std::ptr::null(), 0, true) };
+        unsafe {
+            CGEventSetType(e, 12);
+            CGEventSetFlags(e, f);
+        }
+        post(e);
+    };
+    if flags != 0 {
+        flags_changed(flags);
+    }
     for down in [true, false] {
         let e = unsafe { CGEventCreateKeyboardEvent(std::ptr::null(), code, down) };
         unsafe { CGEventSetFlags(e, flags) };
+        if let Some(t) = text {
+            unsafe { CGEventKeyboardSetUnicodeString(e, t.len(), t.as_ptr()) };
+        }
         post(e);
+    }
+    if flags != 0 {
+        flags_changed(0);
     }
 }
 
@@ -207,7 +277,7 @@ pub fn press(combo: &str) -> Result<(), String> {
         };
     }
     let (code, extra) = keycode(key).ok_or(key.to_string())?;
-    key_event(code, flags | extra);
+    key_event(code, flags | extra, None);
     Ok(())
 }
 

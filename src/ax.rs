@@ -27,6 +27,9 @@ extern "C" {
     fn AXUIElementCreateApplication(pid: i32) -> AXRef;
     fn AXUIElementCopyAttributeValue(e: AXRef, a: CFStringRef, v: *mut CFTypeRef) -> i32;
     fn AXUIElementSetAttributeValue(e: AXRef, a: CFStringRef, v: CFTypeRef) -> i32;
+    fn AXObserverCreate(pid: i32, callback: ObserverCallback, out: *mut AXRef) -> i32;
+    fn AXObserverAddNotification(obs: AXRef, e: AXRef, name: CFStringRef, context: *mut c_void) -> i32;
+    fn AXObserverGetRunLoopSource(obs: AXRef) -> core_foundation_sys::runloop::CFRunLoopSourceRef;
     fn AXUIElementCopyAttributeNames(e: AXRef, v: *mut CFArrayRef) -> i32;
     fn AXUIElementCopyMultipleAttributeValues(e: AXRef, names: CFArrayRef, opts: u32, v: *mut CFArrayRef) -> i32;
     fn AXValueGetTypeID() -> CFTypeID;
@@ -144,6 +147,27 @@ pub fn restore_web() {
     for (pid, flag) in ENABLED.lock().unwrap().drain(..) {
         let _ = set_bool(app_element(pid).0, flag, false);
     }
+}
+
+pub type ObserverCallback = extern "C" fn(AXRef, AXRef, CFStringRef, *mut c_void);
+
+/// An AXObserver for some of an app's notifications, scheduled on this thread's run loop
+/// (run it with run_loop_for). Dropping it unschedules it.
+pub fn observe(pid: i32, names: &[&str], callback: ObserverCallback, context: *mut c_void) -> Option<Cf> {
+    let mut obs: AXRef = std::ptr::null();
+    if unsafe { AXObserverCreate(pid, callback, &mut obs) } != 0 || obs.is_null() {
+        return None;
+    }
+    let app = app_element(pid);
+    for n in names {
+        unsafe { AXObserverAddNotification(obs, app.0, cfstr(n).0 as _, context) };
+    }
+    unsafe { core_foundation_sys::runloop::CFRunLoopAddSource(core_foundation_sys::runloop::CFRunLoopGetCurrent(), AXObserverGetRunLoopSource(obs), core_foundation_sys::runloop::kCFRunLoopDefaultMode) };
+    Some(Cf(obs))
+}
+
+pub fn run_loop_for(seconds: f64) {
+    unsafe { core_foundation_sys::runloop::CFRunLoopRunInMode(core_foundation_sys::runloop::kCFRunLoopDefaultMode, seconds, 0) };
 }
 
 pub fn attr(e: AXRef, name: &str) -> Option<Cf> {

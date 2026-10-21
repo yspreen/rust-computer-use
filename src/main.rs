@@ -1,6 +1,7 @@
 //! Clean-room MCP stdio server exposing the Codex Computer Use tool interface on macOS.
 mod apps;
 mod ax;
+mod cursor;
 mod input;
 mod overlay;
 mod setup;
@@ -292,12 +293,9 @@ fn call(srv: &mut Server, name: &str, a: &Value) -> Result<Value, String> {
         return Err(format!("The user changed '{}'. Re-query the latest state with `get_app_state` before sending more actions.", app.name));
     }
     input::target(app.pid, snap.window_id, Pt { x: snap.window.0, y: snap.window.1 });
-    if apps::frontmost() != Some(app.pid) {
-        input::believe_active(app.pid);
-    }
     act(snap, name, a, &app)?;
-    // Actions answer with the resulting state, as the original does.
-    std::thread::sleep(std::time::Duration::from_millis(250));
+    // Actions answer with the resulting state once the UI settles, as the original does.
+    settle(app.pid);
     state(&mut srv.snaps, &app, None)
         .or_else(|_| Ok(text("Action completed. Call `get_app_state` to fetch the updated UI state.")))
 }
@@ -316,33 +314,52 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App) -> Result<(), St
         ax::frame(e.0).map(|(x, y, w, h)| Pt { x: x + w / 2.0, y: y + h / 2.0 }).ok_or(server_err("element has no frame"))
     };
     let f = |k: &str| a[k].as_f64().ok_or(format!("Missing required argument: {k}"));
+    // Before the first synthesized event, a background app is made to believe it is active.
+    let activate = || {
+        if apps::frontmost() != Some(app.pid) {
+            let win = ax::window(ax::app_element(app.pid).0);
+            input::believe_active(app.pid, win.and_then(|w| input::ax_point(w.0, "AXActivationPoint")));
+        }
+    };
 
     match name {
         "click" => {
             let button = a["mouse_button"].as_str().unwrap_or("left");
             let count = a["click_count"].as_i64().unwrap_or(1);
-            let point = if a.get("element_index").is_some() {
+            // The cursor glides to the spot first; the click goes out once it is close enough.
+            let w = snap.window_id;
+            if a.get("element_index").is_some() {
                 let e = elem()?;
-                let pressed = button == "left"
-                    && count == 1
-                    && ax::actions(e.0).iter().any(|(n, _)| n == "AXPress")
-                    && ax::perform(e.0, "AXPress").is_ok();
-                if pressed {
-                    center(e).map(overlay::point_at).ok();
+                // Element clicks land on the activation point, else the frame center.
+                let at = match input::ax_point(e.0, "AXActivationPoint") {
+                    Some(p) => p,
+                    None => center(e)?,
+                };
+                cursor::move_to(at, w);
+                let press = button == "left" && count == 1 && ax::actions(e.0).iter().any(|(n, _)| n == "AXPress");
+                if press && ax::perform(e.0, "AXPress").is_ok() {
+                    cursor::press(1);
+                    return Ok(());
                 }
-                (!pressed).then(|| center(e)).transpose()?
+                activate();
+                click_with_cursor(at, button, count, false);
             } else {
-                Some(to_screen(f("x")?, f("y")?))
-            };
-            if let Some(p) = point {
-                input::click(p, button, count);
-                overlay::point_at(p);
+                let at = to_screen(f("x")?, f("y")?);
+                let inside = |(x, y, w, h): (f64, f64, f64, f64)| at.x >= x && at.x < x + w && at.y >= y && at.y < y + h;
+                if !windows(app.pid, true).into_iter().any(|(_, b)| inside(b)) && !inside(snap.window) {
+                    return Err(server_err(format!("windowNotFoundAtPosition(({:?}, {:?}))", at.x, at.y)));
+                }
+                cursor::move_to(at, w);
+                activate();
+                click_with_cursor(at, button, count, true);
             }
         }
         "drag" => {
             let (from, to) = (to_screen(f("from_x")?, f("from_y")?), to_screen(f("to_x")?, f("to_y")?));
+            cursor::move_to(from, snap.window_id);
+            activate();
             input::drag(from, to);
-            overlay::point_at(to);
+            cursor::move_to(to, snap.window_id);
         }
         "perform_secondary_action" => {
             let e = elem()?;
@@ -355,21 +372,13 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App) -> Result<(), St
             let action = ax::actions(e.0).into_iter().find(|(n, d)| d == want || n == want).ok_or_else(invalid)?;
             ax::perform(e.0, &action.0).map_err(server_err)?;
         }
-        "press_key" => input::press(a["key"].as_str().unwrap_or("")).map_err(|k| server_err(format!("keyNotFound(\"{k}\")")))?,
+        "press_key" => {
+            activate();
+            input::press(a["key"].as_str().unwrap_or("")).map_err(|k| server_err(format!("keyNotFound(\"{k}\")")))?
+        }
         "type_text" => {
-            let t = a["text"].as_str().unwrap_or("");
-            // Insert at the caret through AX when possible; it needs no keyboard focus.
-            let focused = ax::attr(ax::app_element(app.pid).0, "AXFocusedUIElement");
-            // Some apps (Chrome) accept the write but ignore it, so confirm the text changed.
-            let inserted = focused.is_some_and(|f| {
-                let before = ax::attr_str(f.0, "AXValue");
-                ax::settable(f.0, "AXSelectedText")
-                    && ax::set_attr(f.0, "AXSelectedText", ax::cfstr(t).0).is_ok()
-                    && ax::attr_str(f.0, "AXValue") != before
-            });
-            if !inserted {
-                input::type_text(t);
-            }
+            activate();
+            input::type_text(a["text"].as_str().unwrap_or(""));
         }
         "set_value" => {
             let e = elem()?;
@@ -382,21 +391,22 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App) -> Result<(), St
             let e = elem()?;
             let dir = a["direction"].as_str().unwrap_or("down");
             let pages = a["pages"].as_f64().unwrap_or(1.0);
-            let action = format!("AXScroll{}{}ByPage", dir[..1].to_uppercase(), &dir[1..]);
-            if pages.fract() == 0.0 && ax::actions(e.0).iter().any(|(n, _)| *n == action) {
-                (0..pages as usize).try_for_each(|_| ax::perform(e.0, &action)).map_err(server_err)?;
-            } else {
-                let (_, _, w, h) = ax::frame(e.0).ok_or(server_err("element has no frame"))?;
-                let px = |size: f64| (pages * size).round() as i32; // a page is the element's extent
-                let (dy, dx) = match dir {
-                    "up" => (-px(h), 0),
-                    "down" => (px(h), 0),
-                    "left" => (0, -px(w)),
-                    _ => (0, px(w)),
-                };
-                input::scroll(center(e)?, dy, dx);
-                overlay::point_at(center(e)?);
+            if pages <= 0.0 {
+                return Err("pages must be > 0".into());
             }
+            // One pixel scroll of pages x the element's extent at its center, as the original
+            // sends (it never uses the AX page actions).
+            let (_, _, w, h) = ax::frame(e.0).ok_or(server_err("element has no frame"))?;
+            let px = |size: f64| (pages * size).round() as i32;
+            let (dy, dx) = match dir {
+                "up" => (-px(h), 0),
+                "down" => (px(h), 0),
+                "left" => (0, -px(w)),
+                _ => (0, px(w)),
+            };
+            cursor::move_to(center(e)?, snap.window_id);
+            activate();
+            input::scroll(center(e)?, dy, dx);
         }
         "select_text" => {
             let e = elem()?;
@@ -428,6 +438,34 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App) -> Result<(), St
 
 /// The original's build number, which its state header reports.
 const CUA_VERSION: u32 = 1001501;
+
+/// Wait for the app to settle like the original: watch its AX notifications, polling every
+/// 0.1 s, until 0.25 s pass without one (at most 5 s).
+fn settle(pid: i32) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let start = std::time::Instant::now();
+    let since = |t: &std::time::Instant| t.elapsed().as_millis() as u64;
+    extern "C" fn noted(_o: *const std::ffi::c_void, _e: *const std::ffi::c_void, _n: core_foundation_sys::string::CFStringRef, start: *mut std::ffi::c_void) {
+        let start = unsafe { &*(start as *const std::time::Instant) };
+        LAST.store(start.elapsed().as_millis() as u64, Relaxed);
+    }
+    LAST.store(0, Relaxed);
+    let names = ["AXTitleChanged", "AXLayoutChanged", "AXFocusedWindowChanged", "AXFocusedUIElementChanged", "AXElementBusyChanged",
+        "AXMenuOpened", "AXSheetCreated", "AXWindowCreated", "AXCreated", "AXUIElementDestroyed"];
+    let observer = ax::observe(pid, &names, noted, &start as *const _ as _);
+    while since(&start) < 5000 && since(&start).saturating_sub(LAST.load(Relaxed)) < 250 {
+        ax::run_loop_for(0.1);
+    }
+    drop(observer);
+}
+
+/// Post the click while the cursor shows it being pressed.
+fn click_with_cursor(at: Pt, button: &str, count: i64, hover: bool) {
+    let shown = std::thread::spawn(move || cursor::press(count));
+    input::click(at, button, count, hover);
+    let _ = shown.join();
+}
 
 const SELECTION_NOTE: &str = "Note: Pay special attention to the content selected by the user. If the user asks a question or refers to the content they are looking at on-screen, they might be referring to the selected content (but they might be referring to something else that's visible, too).";
 

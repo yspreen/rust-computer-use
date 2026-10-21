@@ -1,8 +1,10 @@
-//! The AppKit side of the session: the main-thread run loop, Esc to stop the agent, and the
-//! user's own input to the apps it controls, like the original's overlay.
+//! The AppKit side of the session: the main-thread run loop, Esc to stop the agent, the user's
+//! own input to the apps it controls, and keeping those apps from taking the front, like the
+//! original's overlay and focus-steal preventer.
 use block2::RcBlock;
 use objc2::MainThreadMarker;
 use objc2_app_kit::*;
+use objc2_foundation::NSNotification;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -11,6 +13,8 @@ static ACTIVE: Mutex<Option<Instant>> = Mutex::new(None);
 static STOPPED: Mutex<Option<Instant>> = Mutex::new(None);
 /// The user's last key press, click or scroll per app (pid).
 static TOUCHED: Mutex<Vec<(i32, Instant)>> = Mutex::new(Vec::new());
+/// The app the agent acts in, and the app that was frontmost when it started.
+static GUARD: Mutex<Option<(i32, i32)>> = Mutex::new(None);
 const SESSION_IDLE: Duration = Duration::from_secs(30);
 
 /// Run AppKit on the main thread (never returns); `work` runs the MCP loop on another thread.
@@ -39,6 +43,23 @@ pub fn run(work: impl FnOnce() + Send + 'static) -> ! {
     let mask = NSEventMask::KeyDown | NSEventMask::LeftMouseDown | NSEventMask::RightMouseDown
         | NSEventMask::OtherMouseDown | NSEventMask::ScrollWheel;
     std::mem::forget(NSEvent::addGlobalMonitorForEventsMatchingMask_handler(mask, &input));
+    // An app that believes it is active can take the front by itself (Chrome on super+l). The
+    // moment it does without the user's input, hand the front straight back, before the
+    // window server shows it.
+    let activated = RcBlock::new(|n: std::ptr::NonNull<NSNotification>| {
+        let app = unsafe { n.as_ref() }.userInfo().and_then(|u| u.objectForKey(unsafe { NSWorkspaceApplicationKey }));
+        let pid = app.and_then(|a| a.downcast::<NSRunningApplication>().ok()).map(|a| a.processIdentifier());
+        let user = TOUCHED.lock().unwrap().iter().any(|(_, t)| t.elapsed() < Duration::from_secs(1));
+        if let (Some(pid), Some((target, front)), false) = (pid, *GUARD.lock().unwrap(), user) {
+            if pid == target {
+                crate::input::set_front(front);
+            }
+        }
+    });
+    let center = NSWorkspace::sharedWorkspace().notificationCenter();
+    std::mem::forget(unsafe {
+        center.addObserverForName_object_queue_usingBlock(Some(NSWorkspaceDidActivateApplicationNotification), None, None, &activated)
+    });
     std::thread::spawn(move || {
         work();
         std::process::exit(0);
@@ -56,6 +77,13 @@ pub fn stopped() -> bool {
     }
     *ACTIVE.lock().unwrap() = Some(Instant::now());
     s.is_some()
+}
+
+/// Keep `target` from taking the front from `front` while the agent works in it.
+pub fn guard(target: i32, front: Option<i32>) {
+    if let Some(front) = front.filter(|&f| f != target) {
+        *GUARD.lock().unwrap() = Some((target, front));
+    }
 }
 
 /// When the user last pressed a key, clicked or scrolled in the app.

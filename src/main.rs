@@ -262,20 +262,10 @@ fn call(srv: &mut Server, name: &str, a: &Value) -> Result<Value, String> {
         }
     }
     input::target(app.pid, snap.window_id, Pt { x: snap.window.0, y: snap.window.1 });
-    // The app may bring itself to the front while it believes it is active; hand the front
-    // back to the user's app.
-    let front = apps::frontmost().filter(|&p| p != app.pid);
-    let restore = || {
-        if let Some(p) = front.filter(|_| apps::frontmost() == Some(app.pid)) {
-            input::set_front(p);
-        }
-    };
-    let acted = act(snap, name, a, &app);
-    restore();
-    acted?;
+    overlay::guard(app.pid, apps::frontmost());
+    act(snap, name, a, &app)?;
     // Actions answer with the resulting state once the UI settles, as the original does.
     settle(app.pid);
-    restore();
     state(&mut srv.snaps, &app, false)
         .or_else(|_| Ok(text("Action completed. Call `get_app_state` to fetch the updated UI state.")))
 }

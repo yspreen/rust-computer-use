@@ -494,8 +494,8 @@ const BROWSER_NOTES: &str = "## Browser Computer Use\n\nWhen navigating to a new
 
 /// Per-app guidance, assembled like the original: the browser note for any app that handles
 /// http URLs, then the first `<name>.md` found for the app's candidate names (Music's file is
-/// "AppleMusic", then CFBundleName, then the bundle id). Files come from
-/// The Codex Computer Use app's bundled AppInstructions.
+/// "AppleMusic", then CFBundleName, then the bundle id). Files come from the Codex Computer
+/// Use app's bundled AppInstructions.
 fn instructions(app: &apps::App) -> String {
     let bundle = objc2_foundation::NSBundle::bundleWithPath(&objc2_foundation::NSString::from_str(&app.path));
     let info = |k: &str| bundle.as_ref().and_then(|b| b.objectForInfoDictionaryKey(&objc2_foundation::NSString::from_str(k)));

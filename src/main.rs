@@ -4,6 +4,7 @@ mod ax;
 mod cursor;
 mod input;
 mod overlay;
+mod service;
 mod setup;
 mod text;
 
@@ -32,10 +33,11 @@ extern "C" {
     fn CGSessionCopyCurrentDictionary() -> *const std::ffi::c_void;
 }
 
-/// JSON-RPC over stdio. Server-initiated requests (elicitation) wait for their reply and
-/// queue anything else that arrives meanwhile.
+/// JSON-RPC, one message per line. Server-initiated requests (elicitation) wait for their
+/// reply and queue anything else that arrives meanwhile.
 struct Io {
-    lines: std::io::Lines<std::io::StdinLock<'static>>,
+    lines: std::io::Lines<Box<dyn BufRead + Send>>,
+    out: Box<dyn Write + Send>,
     queue: VecDeque<Value>,
     next_id: u64,
 }
@@ -55,7 +57,7 @@ impl Io {
     fn request(&mut self, method: &str, params: Value) -> Option<Value> {
         self.next_id += 1;
         let id = format!("rust-computer-use-{}", self.next_id);
-        reply(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
+        self.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
         loop {
             let m: Value = serde_json::from_str(&self.lines.next()?.ok()?).ok()?;
             if m["id"] == json!(id) && m.get("method").is_none() {
@@ -63,6 +65,11 @@ impl Io {
             }
             self.queue.push_back(m);
         }
+    }
+
+    fn send(&mut self, v: Value) {
+        let _ = writeln!(self.out, "{v}");
+        let _ = self.out.flush();
     }
 }
 
@@ -82,7 +89,22 @@ fn approvals_path() -> std::path::PathBuf {
 
 fn main() {
     input::warm(); // keyboard layout lookups must happen on the main thread
-    if std::env::args().any(|a| a == "--setup") {
+    let setup = std::env::args().any(|a| a == "--setup");
+    let bundle = service::bundle();
+    if let Some(app) = bundle.as_ref().filter(|_| !service::launched_by_launch_services()) {
+        // Started by the MCP host (or a shell): the app does the work, we relay.
+        if setup {
+            std::process::exit(if service::launch(app, "--setup") { 0 } else { 1 });
+        }
+        if let Err(e) = service::relay(app) {
+            eprintln!("rust-computer-use: {e}");
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
+    // Opened from Finder (no arguments) the app walks through the permissions.
+    let service = std::env::args().any(|a| a == "--service");
+    if setup || (bundle.is_some() && !service) {
         // Just the permission walkthrough; the process ends when its window closes.
         overlay::run(|| {
             setup::show(true);
@@ -91,16 +113,19 @@ fn main() {
             }
         })
     }
-    overlay::run(serve)
+    if service {
+        overlay::run(|| service::listen(serve))
+    }
+    overlay::run(|| serve(Box::new(std::io::BufReader::new(std::io::stdin())), Box::new(std::io::stdout())))
 }
 
-fn serve() {
+fn serve(input: Box<dyn BufRead + Send>, out: Box<dyn Write + Send>) {
     let saved = std::fs::read_to_string(approvals_path()).unwrap_or_default();
     let approved = serde_json::from_str::<Value>(&saved).ok().and_then(|v| {
         v["approvedBundleIdentifiers"].as_array().map(|a| a.iter().filter_map(|b| b.as_str().map(String::from)).collect())
     });
     let mut srv = Server {
-        io: Io { lines: std::io::stdin().lock().lines(), queue: VecDeque::new(), next_id: 0 },
+        io: Io { lines: input.lines(), out, queue: VecDeque::new(), next_id: 0 },
         snaps: HashMap::new(),
         can_elicit: false,
         approved: approved.unwrap_or_default(),
@@ -130,20 +155,14 @@ fn serve() {
             "ping" => json!({}),
             m => {
                 let error = json!({"code": -32601, "message": format!("unknown method {m}")});
-                reply(json!({"jsonrpc": "2.0", "id": id, "error": error}));
+                srv.io.send(json!({"jsonrpc": "2.0", "id": id, "error": error}));
                 continue;
             }
         };
-        reply(json!({"jsonrpc": "2.0", "id": id, "result": result}));
+        srv.io.send(json!({"jsonrpc": "2.0", "id": id, "result": result}));
     }
     ax::restore_web();
     input::disbelieve_all();
-}
-
-fn reply(v: Value) {
-    let mut out = std::io::stdout().lock();
-    let _ = writeln!(out, "{v}");
-    let _ = out.flush();
 }
 
 /// Tool schemas, worded exactly as the original advertises them.
@@ -219,15 +238,20 @@ fn validate(name: &str, a: &Value) -> Result<(), String> {
     Ok(())
 }
 
-/// Accessibility and Screen Recording. When either is missing, the setup panel opens to walk
-/// the user through granting them.
+/// Accessibility and Screen Recording. When either is missing the setup window opens; while
+/// it is up (for 100 s, the original's grant timeout) calls report the grant as pending.
 fn permissions() -> Result<(), String> {
+    static OPENED: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
     if setup::all_granted() {
         return Ok(());
     }
+    let mut opened = OPENED.lock().unwrap();
+    if setup::is_open() && opened.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(100)) {
+        return Err("Computer Use permissions are still pending. The user has not finished granting Accessibility and Screen Recording permissions in the Rust Computer Use window. Call this tool again, as the user is almost done finishing granting permissions. Do not end your turn yet, just call this tool again.".into());
+    }
     setup::show(false);
-    let host = setup::host().0;
-    Err(format!("Computer Use permissions are not granted. A setup window is open on the Mac: the user needs to allow Accessibility and Screen Recording for {host} there. Call this tool again once they have."))
+    *opened = Some(std::time::Instant::now());
+    Err("Computer Use permissions are not granted".into())
 }
 
 fn screen_locked() -> bool {
@@ -250,14 +274,22 @@ fn approve(srv: &mut Server, app: &apps::App, q: &str) -> Result<(), String> {
     let answer = srv.io.request("elicitation/create", params);
     match answer.as_ref().and_then(|r| r["result"]["action"].as_str()) {
         Some("accept") => {
+            // Approved for this session; kept across sessions only when the client says so.
             srv.approved.insert(app.bundle_id.clone());
-            let path = approvals_path();
-            let mut ids: Vec<&String> = srv.approved.iter().collect();
-            ids.sort();
-            let saved = std::fs::create_dir_all(path.parent().unwrap())
-                .and_then(|_| std::fs::write(&path, json!({"approvedBundleIdentifiers": ids}).to_string()));
-            if saved.is_err() {
-                eprintln!("Computer Use could not persist the approval permanently for app '{q}'.");
+            if answer.as_ref().is_some_and(|r| r["result"]["_meta"]["persist"] == "always") {
+                let path = approvals_path();
+                let saved = std::fs::read_to_string(&path).unwrap_or_default();
+                let mut ids: Vec<String> = serde_json::from_str::<Value>(&saved).ok()
+                    .and_then(|v| serde_json::from_value(v["approvedBundleIdentifiers"].clone()).ok())
+                    .unwrap_or_default();
+                ids.push(app.bundle_id.clone());
+                ids.sort();
+                ids.dedup();
+                let written = std::fs::create_dir_all(path.parent().unwrap())
+                    .and_then(|_| std::fs::write(&path, json!({"approvedBundleIdentifiers": ids}).to_string()));
+                if written.is_err() {
+                    return Err(format!("Computer Use could not persist the approval permanently for app '{q}'."));
+                }
             }
             Ok(())
         }

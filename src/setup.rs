@@ -79,7 +79,16 @@ pub fn is_open() -> bool {
 
 struct TileIvars {
     url: Retained<NSURL>,
-    icon: Retained<NSImage>,
+}
+
+/// What a view currently draws, as an image.
+fn snapshot(view: &NSView) -> Retained<NSImage> {
+    let image = NSImage::initWithSize(NSImage::alloc(), view.bounds().size);
+    if let Some(rep) = view.bitmapImageRepForCachingDisplayInRect(view.bounds()) {
+        view.cacheDisplayInRect_toBitmapImageRep(view.bounds(), &rep);
+        image.addRepresentation(&rep);
+    }
+    image
 }
 
 define_class!(
@@ -98,15 +107,23 @@ define_class!(
                 NSDraggingItem::alloc(),
                 ProtocolObject::from_ref(&*self.ivars().url),
             );
-            // The whole row follows the pointer, as in the original.
-            let snapshot = self.bitmapImageRepForCachingDisplayInRect(self.bounds()).map(|rep| {
-                self.cacheDisplayInRect_toBitmapImageRep(self.bounds(), &rep);
-                let image = NSImage::initWithSize(NSImage::alloc(), self.bounds().size);
-                image.addRepresentation(&rep);
-                image
-            });
-            let contents = snapshot.unwrap_or_else(|| self.ivars().icon.clone());
-            unsafe { item.setDraggingFrame_contents(self.bounds(), Some(&contents)) };
+            // Icon and name as separate pieces, as Finder drags files, so a drop target can
+            // fold the row into the app's icon smoothly.
+            item.setDraggingFrame(self.bounds());
+            let views = self.subviews();
+            let pieces: Vec<Retained<NSDraggingImageComponent>> = views
+                .iter()
+                .zip([unsafe { NSDraggingImageComponentIconKey }, unsafe { NSDraggingImageComponentLabelKey }])
+                .map(|(view, key)| {
+                    let piece = NSDraggingImageComponent::draggingImageComponentWithKey(key);
+                    unsafe { piece.setContents(Some(&snapshot(&view))) };
+                    piece.setFrame(view.frame());
+                    piece
+                })
+                .collect();
+            let pieces = NSArray::from_retained_slice(&pieces);
+            let provider = RcBlock::new(move || std::ptr::NonNull::from(&*pieces));
+            unsafe { item.setImageComponentsProvider(Some(&provider)) };
             let items = NSArray::from_retained_slice(&[item]);
             let session = self.beginDraggingSessionWithItems_event_source(&items, event, ProtocolObject::from_ref(self));
             session.setAnimatesToStartingPositionsOnCancelOrFail(true);
@@ -388,7 +405,7 @@ fn build(mtm: MainThreadMarker, exit_when_done: bool) -> Setup {
     let hint_label = NSTextField::labelWithAttributedString(&hint(&host, ""), mtm);
     hint_label.setFrame(rect(62.0, 64.0, 450.0, 20.0));
     pane.addSubview(&hint_label);
-    let tile = DragTile::alloc(mtm).set_ivars(TileIvars { url: host_url, icon: own.clone() });
+    let tile = DragTile::alloc(mtm).set_ivars(TileIvars { url: host_url });
     let tile: Retained<DragTile> = unsafe { msg_send![super(tile), initWithFrame: rect(62.0, 21.0, 451.0, 40.0)] };
     let tile_icon = NSImageView::imageViewWithImage(&own, mtm);
     tile_icon.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);

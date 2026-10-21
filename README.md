@@ -12,7 +12,7 @@ shasum -a 256 -c rust-computer-use-aarch64-apple-darwin.tar.gz.sha256
 tar -xzf rust-computer-use-aarch64-apple-darwin.tar.gz
 xattr -cr "Rust Computer Use.app"
 mv "Rust Computer Use.app" /Applications/
-claude mcp add rust-computer-use -- "/Applications/Rust Computer Use.app/Contents/MacOS/rust-computer-use"
+claude mcp add -s user rust-computer-use -- "/Applications/Rust Computer Use.app/Contents/MacOS/rust-computer-use"
 ```
 
 The app is signed but not notarized. A browser download gets a quarantine flag
@@ -24,7 +24,7 @@ To build from source instead:
 
 ```sh
 scripts/bundle.sh   # set CODESIGN_IDENTITY to sign with your own certificate
-claude mcp add rust-computer-use -- "$PWD/target/release/Rust Computer Use.app/Contents/MacOS/rust-computer-use"
+claude mcp add -s user rust-computer-use -- "$PWD/target/release/Rust Computer Use.app/Contents/MacOS/rust-computer-use"
 ```
 
 ## What it is

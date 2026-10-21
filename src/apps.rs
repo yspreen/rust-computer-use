@@ -11,15 +11,6 @@ pub struct App {
     pub frontmost: bool,
 }
 
-/// Apps the original refuses outright: terminals (a GUI path to a shell) and OpenAI's own apps.
-const BLOCKED: &[&str] = &[
-    "com.apple.Terminal", "com.googlecode.iterm2", "dev.warp.Warp-Stable", "net.kovidgoyal.kitty",
-    "com.github.wez.wezterm", "com.mitchellh.ghostty", "com.raphaelamorim.rio", "dev.commandline.waveterm",
-    "com.openai.codex", "com.openai.codex.alpha", "com.openai.codex.beta", "com.openai.codex.dev",
-    "com.openai.codex.nightly", "com.openai.chat", "com.openai.chat.alpha", "com.openai.chat.beta",
-    "com.openai.chat.nightly", "com.openai.chat.mac-debug",
-];
-
 fn s(v: Option<objc2::rc::Retained<NSString>>) -> String {
     v.map(|v| v.to_string()).unwrap_or_default()
 }
@@ -39,6 +30,26 @@ pub fn running() -> Vec<App> {
         .collect()
 }
 
+/// Whether the app registers the http URL scheme (CFBundleURLTypes), the original's browser test.
+pub fn handles_http(path: &str) -> bool {
+    let Some(types) = NSBundle::bundleWithPath(&NSString::from_str(path))
+        .and_then(|b| b.objectForInfoDictionaryKey(&NSString::from_str("CFBundleURLTypes")))
+        .and_then(|t| t.downcast::<objc2_foundation::NSArray>().ok())
+    else {
+        return false;
+    };
+    let key = NSString::from_str("CFBundleURLSchemes");
+    types.iter().filter_map(|t| t.downcast::<objc2_foundation::NSDictionary>().ok()).any(|d| {
+        d.objectForKey(&key)
+            .and_then(|s| s.downcast::<objc2_foundation::NSArray>().ok())
+            .is_some_and(|s| s.iter().any(|x| x.downcast_ref::<NSString>().is_some_and(|x| x.to_string().eq_ignore_ascii_case("http"))))
+    })
+}
+
+pub fn frontmost() -> Option<i32> {
+    NSWorkspace::sharedWorkspace().frontmostApplication().map(|a| a.processIdentifier())
+}
+
 fn matches(a: &App, q: &str) -> bool {
     let q = q.trim_end_matches('/');
     a.pid.to_string() == q || a.name.eq_ignore_ascii_case(q) || a.bundle_id.eq_ignore_ascii_case(q) || a.path == q
@@ -56,24 +67,13 @@ fn locate(q: &str) -> Option<String> {
     path.map(|p| p.to_string())
 }
 
-fn bundle_id(path: &str) -> String {
-    s(NSBundle::bundleWithPath(&NSString::from_str(path)).and_then(|b| b.bundleIdentifier()))
-}
-
 /// Find a running app by name, path, or bundle id, launching it in the background if needed.
 pub fn resolve(q: &str) -> Result<App, String> {
     let found = running().into_iter().find(|a| matches(a, q));
-    let (path, bid) = match &found {
-        Some(a) => (a.path.clone(), a.bundle_id.clone()),
-        None => {
-            let p = locate(q).ok_or(format!("Invalid app: {q}"))?;
-            let b = bundle_id(&p);
-            (p, b)
-        }
+    let path = match &found {
+        Some(a) => a.path.clone(),
+        None => locate(q).ok_or(format!("Invalid app: {q}"))?,
     };
-    if BLOCKED.iter().any(|b| b.eq_ignore_ascii_case(&bid)) {
-        return Err(format!("Computer Use is not allowed to use the app '{q}' for safety reasons."));
-    }
     if let Some(a) = found {
         return Ok(a);
     }

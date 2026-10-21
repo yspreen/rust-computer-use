@@ -46,6 +46,24 @@ extern "C" {
     ) -> i32;
 }
 
+/// Tell a background app it is (or is no longer) the active app without activating it, as the
+/// original's focus enforcer does: an AppKit-defined ApplicationActivated (1) or Deactivated (2)
+/// event posted to the process. AppKit only honors key equivalents and modifier navigation
+/// (super+s, shift+alt+Left) in an app that believes it is active.
+pub fn notify_active(pid: i32, active: bool) {
+    use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType};
+    let ev = NSEvent::otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2(
+        NSEventType::AppKitDefined, objc2_foundation::NSPoint::ZERO, NSEventModifierFlags(0), 0.0, 0, None,
+        if active { 1 } else { 2 }, 0, 0,
+    );
+    if let Some(ev) = ev {
+        let cg: *const c_void = unsafe { objc2::msg_send![&*ev, CGEvent] };
+        if !cg.is_null() {
+            unsafe { CGEventPostToPid(pid, cg) };
+        }
+    }
+}
+
 /// `origin` is the window's top-left corner in global points.
 pub fn target(pid: i32, window: u32, origin: Pt) {
     PID.store(pid, Relaxed);
@@ -128,8 +146,8 @@ pub fn type_text(text: &str) {
         }
         // One event per character: many apps read only the first unit of a multi-char event.
         for ch in line.chars() {
-            if let Some(&(code, shift)) = layout().get(&ch) {
-                key_event(code, if shift { 0x20000 } else { 0 });
+            if let Some(&(code, flags)) = layout().get(&ch) {
+                key_event(code, flags);
                 continue;
             }
             let mut buf = [0u16; 2];
@@ -166,8 +184,8 @@ pub fn press(combo: &str) -> Result<(), String> {
             _ => return Err(m.to_string()),
         };
     }
-    let (code, shift) = keycode(key).ok_or(key.to_string())?;
-    key_event(code, flags | if shift { 0x20000 } else { 0 });
+    let (code, extra) = keycode(key).ok_or(key.to_string())?;
+    key_event(code, flags | extra);
     Ok(())
 }
 
@@ -175,10 +193,11 @@ pub fn warm() {
     layout();
 }
 
-/// Character -> (keycode, needs shift) for the current keyboard layout, like the original's
-/// UCKeyTranslate lookup. Built once; main-row keys win over keypad duplicates.
-fn layout() -> &'static HashMap<char, (u16, bool)> {
-    static MAP: OnceLock<HashMap<char, (u16, bool)>> = OnceLock::new();
+/// Character -> (keycode, event flags) for the current keyboard layout, like the original's
+/// UCKeyTranslate lookup: the same eight shift/option/control combinations in the same order.
+/// Built once; main-row keys win over keypad duplicates.
+fn layout() -> &'static HashMap<char, (u16, u64)> {
+    static MAP: OnceLock<HashMap<char, (u16, u64)>> = OnceLock::new();
     MAP.get_or_init(|| {
         let mut map = HashMap::new();
         unsafe {
@@ -189,14 +208,19 @@ fn layout() -> &'static HashMap<char, (u16, bool)> {
             }
             let ptr = core_foundation_sys::data::CFDataGetBytePtr(data as _);
             let kbd = LMGetKbdType() as u32;
-            for (mods, shift) in [(0, false), (2, true)] {
+            for carbon in [0u32, 0x200, 0x800, 0xa00, 0x1000, 0x1200, 0x1800, 0x1a00] {
+                let mods = carbon >> 8;
+                let flags = [(0x200, 0x20000), (0x800, 0x80000), (0x1000, 0x40000)]
+                    .iter()
+                    .filter(|(c, _)| carbon & c != 0)
+                    .fold(0u64, |f, (_, cg)| f | cg);
                 for code in 0..128u16 {
                     let (mut dead, mut len, mut buf) = (0u32, 0usize, [0u16; 4]);
                     // kUCKeyActionDown, kUCKeyTranslateNoDeadKeysMask
                     UCKeyTranslate(ptr, code, 0, mods, kbd, 1, &mut dead, 4, &mut len, buf.as_mut_ptr());
                     let c = char::decode_utf16(buf[..len].iter().copied()).next().and_then(Result::ok);
                     if let Some(c) = c.filter(|c| !c.is_control()) {
-                        map.entry(c).or_insert((code, shift));
+                        map.entry(c).or_insert((code, flags));
                     }
                 }
             }
@@ -205,8 +229,8 @@ fn layout() -> &'static HashMap<char, (u16, bool)> {
     })
 }
 
-/// macOS virtual keycode for an xdotool keysym; bool = needs shift.
-fn keycode(k: &str) -> Option<(u16, bool)> {
+/// macOS virtual keycode for an xdotool keysym, plus the modifier flags its character needs.
+fn keycode(k: &str) -> Option<(u16, u64)> {
     let mut chars = k.chars();
     if let (Some(c), None) = (chars.next(), chars.next()) {
         return layout().get(&c).copied();
@@ -234,7 +258,7 @@ fn keycode(k: &str) -> Option<(u16, bool)> {
         ("f8", 100), ("f9", 101), ("f10", 109), ("f11", 103), ("f12", 111),
     ];
     if let Some(d) = k.strip_prefix("kp_").and_then(|d| d.parse::<usize>().ok()).filter(|d| *d < 10) {
-        return Some(([82, 83, 84, 85, 86, 87, 88, 89, 91, 92][d], false));
+        return Some(([82, 83, 84, 85, 86, 87, 88, 89, 91, 92][d], 0));
     }
-    named.iter().find(|(n, _)| *n == k).map(|&(_, c)| (c, false))
+    named.iter().find(|(n, _)| *n == k).map(|&(_, c)| (c, 0))
 }

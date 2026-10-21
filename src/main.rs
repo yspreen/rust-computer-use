@@ -70,6 +70,8 @@ struct Server {
     snaps: HashMap<i32, Snapshot>,
     can_elicit: bool,
     approved: HashSet<String>,
+    /// Apps whose instructions this session already delivered; the original sends them once.
+    instructed: HashSet<String>,
 }
 
 fn approvals_path() -> std::path::PathBuf {
@@ -101,6 +103,7 @@ fn serve() {
         snaps: HashMap::new(),
         can_elicit: false,
         approved: approved.unwrap_or_default(),
+        instructed: HashSet::new(),
     };
     while let Some(msg) = srv.io.next() {
         let Some(id) = msg.get("id").cloned().filter(|_| msg.get("method").is_some()) else {
@@ -146,7 +149,16 @@ fn tools() -> Value {
     let idx = json!({"type": "string", "description": "Element identifier"});
     let str_ = |d: &str| json!({"type": "string", "description": d});
     let num = |d: &str| json!({"type": "number", "description": d});
-    let tool = |name: &str, desc: &str, props: Value, req: &[&str]| json!({"name": name, "description": desc, "inputSchema": {"type": "object", "properties": props, "required": req, "additionalProperties": false}});
+    // Only the two readers are hinted read-only and idempotent; every hint is spelled out.
+    let tool = |name: &str, desc: &str, props: Value, req: &[&str]| {
+        let ro = matches!(name, "list_apps" | "get_app_state");
+        let mut schema = json!({"type": "object", "properties": props, "additionalProperties": false});
+        if !req.is_empty() {
+            schema["required"] = json!(req);
+        }
+        let hints = json!({"readOnlyHint": ro, "idempotentHint": ro, "destructiveHint": false, "openWorldHint": false});
+        json!({"name": name, "description": desc, "inputSchema": schema, "annotations": hints})
+    };
     json!([
         tool("list_apps", "List the apps on this computer. Returns the set of apps that are currently running, as well as any that have been used in the last 14 days, including details on usage frequency", json!({}), &[]),
         tool("get_app_state", "Start an app use session if needed, then get the state of the app's key window and return a screenshot and accessibility tree. This must be called once per assistant turn before interacting with the app", json!({"app": app}), &["app"]),
@@ -154,15 +166,9 @@ fn tools() -> Value {
             "x": num("X coordinate in screenshot pixel coordinates"), "y": num("Y coordinate in screenshot pixel coordinates"),
             "click_count": {"type": "integer", "description": "Number of clicks. Defaults to 1"},
             "mouse_button": {"type": "string", "enum": ["left", "right", "middle"], "description": "Mouse button to click. Defaults to left."}}), &["app"]),
-        tool("drag", "Drag from one point to another using pixel coordinates", json!({"app": app, "from_x": num("Start X coordinate"),
-            "from_y": num("Start Y coordinate"), "to_x": num("End X coordinate"), "to_y": num("End Y coordinate")}), &["app", "from_x", "from_y", "to_x", "to_y"]),
         tool("perform_secondary_action", "Invoke a secondary accessibility action exposed by an element", json!({"app": app, "element_index": idx,
             "action": str_("Secondary accessibility action name")}), &["app", "element_index", "action"]),
-        tool("press_key", "Press a key or key-combination on the keyboard, including modifier and navigation keys.\n  - This supports xdotool's `key` syntax.\n  - Examples: \"a\", \"Return\", \"Tab\", \"super+c\", \"Up\", \"KP_0\" (for the numpad 0 key).",
-            json!({"app": app, "key": str_("Key or key combination to press")}), &["app", "key"]),
-        tool("scroll", "Scroll an element in a direction by a number of pages", json!({"app": app, "element_index": idx,
-            "direction": str_("Scroll direction: up, down, left, or right"),
-            "pages": num("Number of pages to scroll. Fractional values are supported. Defaults to 1")}), &["app", "element_index", "direction"]),
+        tool("set_value", "Set the value of a settable accessibility element", json!({"app": app, "element_index": idx, "value": str_("Value to assign")}), &["app", "element_index", "value"]),
         tool("select_text", "Select text inside a text element, or place the text cursor before or after it. Provide text exactly as it appears in the accessibility tree, including any Markdown formatting. If the text is not unique, provide surrounding prefix or suffix text to disambiguate it.",
             json!({"app": str_("App name or bundle identifier"), "element_index": str_("Text element identifier"),
             "text": str_("Target text as shown in the accessibility tree"),
@@ -170,7 +176,13 @@ fn tools() -> Value {
             "suffix": str_("Optional text immediately after the target, used to disambiguate repeated matches"),
             "selection": {"type": "string", "enum": ["text", "cursor_before", "cursor_after"], "description": "Whether to select the text or place the cursor before or after it. Defaults to text."}}),
             &["app", "element_index", "text"]),
-        tool("set_value", "Set the value of a settable accessibility element", json!({"app": app, "element_index": idx, "value": str_("Value to assign")}), &["app", "element_index", "value"]),
+        tool("scroll", "Scroll an element in a direction by a number of pages", json!({"app": app, "element_index": idx,
+            "direction": str_("Scroll direction: up, down, left, or right"),
+            "pages": num("Number of pages to scroll. Fractional values are supported. Defaults to 1")}), &["app", "element_index", "direction"]),
+        tool("drag", "Drag from one point to another using pixel coordinates", json!({"app": app, "from_x": num("Start X coordinate"),
+            "from_y": num("Start Y coordinate"), "to_x": num("End X coordinate"), "to_y": num("End Y coordinate")}), &["app", "from_x", "from_y", "to_x", "to_y"]),
+        tool("press_key", "Press a key or key-combination on the keyboard, including modifier and navigation keys.\n  - This supports xdotool's `key` syntax.\n  - Examples: \"a\", \"Return\", \"Tab\", \"super+c\", \"Up\", \"KP_0\" (for the numpad 0 key).",
+            json!({"app": app, "key": str_("Key or key combination to press")}), &["app", "key"]),
         tool("type_text", "Type literal text using keyboard input", json!({"app": app, "text": str_("Literal text to type")}), &["app", "text"]),
     ])
 }
@@ -188,7 +200,7 @@ fn server_err(m: impl std::fmt::Display) -> String {
 fn validate(name: &str, a: &Value) -> Result<(), String> {
     let schema = tools().as_array().unwrap().iter().find(|t| t["name"] == name).cloned();
     let schema = schema.ok_or(format!("Unknown tool: {name}"))?;
-    let mut required: Vec<&str> = schema["inputSchema"]["required"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
+    let mut required: Vec<&str> = schema["inputSchema"]["required"].as_array().into_iter().flatten().filter_map(|v| v.as_str()).collect();
     if name == "click" && a.get("element_index").is_none() {
         required.extend(["x", "y"]);
     }
@@ -267,7 +279,8 @@ fn call(srv: &mut Server, name: &str, a: &Value) -> Result<Value, String> {
     let app = apps::resolve(q)?;
     if name == "get_app_state" {
         approve(srv, &app, q)?;
-        return state(&mut srv.snaps, &app, true);
+        let notes = if srv.instructed.insert(app.bundle_id.clone()) { instructions(&app) } else { String::new() };
+        return state(&mut srv.snaps, &app, Some(notes));
     }
     let Some(snap) = srv.snaps.get(&app.pid) else {
         return Ok(text(format!("Computer Use is not active for '{q}'. You first must call `get_app_state` to get the latest state before doing other Computer Use actions. If `get_app_state` is not available in your environment, use `tool_search` to surface it.")));
@@ -277,10 +290,13 @@ fn call(srv: &mut Server, name: &str, a: &Value) -> Result<Value, String> {
         return Err(format!("The user changed '{}'. Re-query the latest state with `get_app_state` before sending more actions.", app.name));
     }
     input::target(app.pid, snap.window_id, Pt { x: snap.window.0, y: snap.window.1 });
+    if apps::frontmost() != Some(app.pid) {
+        input::notify_active(app.pid, true);
+    }
     act(snap, name, a, &app)?;
     // Actions answer with the resulting state, as the original does.
     std::thread::sleep(std::time::Duration::from_millis(250));
-    state(&mut srv.snaps, &app, false)
+    state(&mut srv.snaps, &app, None)
         .or_else(|_| Ok(text("Action completed. Call `get_app_state` to fetch the updated UI state.")))
 }
 
@@ -408,6 +424,9 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App) -> Result<(), St
     Ok(())
 }
 
+/// The original's build number, which its state header reports.
+const CUA_VERSION: u32 = 1001501;
+
 const SELECTION_NOTE: &str = "Note: Pay special attention to the content selected by the user. If the user asks a question or refers to the content they are looking at on-screen, they might be referring to the selected content (but they might be referring to something else that's visible, too).";
 
 /// The key window's tree plus menu bar. It ends with what the user has selected in the
@@ -463,26 +482,50 @@ fn render(app: &apps::App) -> Result<(ax::Tree, Cf), String> {
     Ok((tree, win))
 }
 
-/// Per-app guidance from `$RUST_COMPUTER_USE_INSTRUCTIONS/<App name or bundle id>.md`, like the
-/// original's bundled AppInstructions.
+const BROWSER_NOTES: &str = "## Browser Computer Use\n\nWhen navigating to a new website or starting a separate web task, prefer opening a new tab instead of reusing the current tab; reuse the current tab only when the user explicitly asks to continue there or when the current page is clearly the right place to continue the existing workflow.";
+
+/// Per-app guidance, assembled like the original: the browser note for any app that handles
+/// http URLs, then the first `<name>.md` found for the app's candidate names (Music's file is
+/// "AppleMusic", then CFBundleName, then the bundle id). Files come from
+/// `$RUST_COMPUTER_USE_INSTRUCTIONS`, else the Codex Computer Use app's bundled AppInstructions.
 fn instructions(app: &apps::App) -> String {
-    let Some(dir) = std::env::var_os("RUST_COMPUTER_USE_INSTRUCTIONS") else { return String::new() };
-    [&app.name, &app.bundle_id]
-        .iter()
-        .find_map(|n| std::fs::read_to_string(std::path::Path::new(&dir).join(format!("{n}.md"))).ok())
-        .map(|t| format!("<app_specific_instructions>\n{}\n</app_specific_instructions>\n", t.trim()))
-        .unwrap_or_default()
+    let bundle = objc2_foundation::NSBundle::bundleWithPath(&objc2_foundation::NSString::from_str(&app.path));
+    let info = |k: &str| bundle.as_ref().and_then(|b| b.objectForInfoDictionaryKey(&objc2_foundation::NSString::from_str(k)));
+    let mut names: Vec<String> = vec![];
+    if app.bundle_id == "com.apple.Music" {
+        names.push("AppleMusic".into());
+    }
+    names.extend(info("CFBundleName").and_then(|n| n.downcast::<objc2_foundation::NSString>().ok()).map(|n| n.to_string()));
+    names.push(app.bundle_id.clone());
+    let home = std::env::var("HOME").unwrap_or_default();
+    let dirs = [
+        std::env::var("RUST_COMPUTER_USE_INSTRUCTIONS").unwrap_or_default(),
+        format!("{home}/.codex/computer-use/Codex Computer Use.app/Contents/Resources/Package_ComputerUse.bundle/Contents/Resources/AppInstructions"),
+    ];
+    let mut parts: Vec<String> = vec![];
+    if apps::handles_http(&app.path) {
+        parts.push(BROWSER_NOTES.into());
+    }
+    let file = names.iter().find_map(|n| {
+        dirs.iter().filter(|d| !d.is_empty()).find_map(|d| std::fs::read_to_string(format!("{d}/{n}.md")).ok()).filter(|t| !t.is_empty())
+    });
+    parts.extend(file);
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!("<app_specific_instructions>\n{}\n</app_specific_instructions>\n", parts.join("\n\n"))
 }
 
-/// `full` is get_app_state's framing; actions get the shorter one.
-fn state(snaps: &mut HashMap<i32, Snapshot>, app: &apps::App, full: bool) -> Result<Value, String> {
+/// get_app_state passes its instructions (possibly empty) for the full framing; actions pass
+/// None and get the shorter one.
+fn state(snaps: &mut HashMap<i32, Snapshot>, app: &apps::App, notes: Option<String>) -> Result<Value, String> {
     let (tree, win) = render(app)?;
     let title = ax::attr_str(win.0, "AXTitle").unwrap_or_else(|| "Unknown".into());
     let window = format!("Window: \"{title}\", App: {}.\n{}", app.name, tree.text);
-    let body = if full {
+    let body = if let Some(notes) = notes {
         format!(
-            "Computer Use state (Rust Computer Use {})\n{}<app_state>\nApp={}/ (bundleID {}, pid {})\n{window}</app_state>",
-            env!("CARGO_PKG_VERSION"), instructions(app), app.path, app.bundle_id, app.pid
+            "Computer Use state (CUA App Version: {CUA_VERSION})\n{notes}<app_state>\nApp={}/ (bundleID {}, pid {})\n{window}</app_state>",
+            app.path, app.bundle_id, app.pid
         )
     } else {
         format!("App={} (pid {})\n{window}", app.bundle_id, app.pid)

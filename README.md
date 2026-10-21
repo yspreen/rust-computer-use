@@ -67,14 +67,8 @@ seconds. Your real pointer never moves.
 
 ## Safety
 
-- **Approval per app.** The first `get_app_state` for an app asks you through MCP
-  elicitation ("Allow Rust Computer Use to use Calculator?"). The answer lasts
-  for the session. It is saved to
-  `~/Library/Application Support/rust-computer-use/approvals.json` only when the
-  client asks for that (`_meta.persist: "always"`). Clients without elicitation are
-  refused unless `RUST_COMPUTER_USE_APPROVE_ALL=1` is set.
-- **Any app.** Unlike the original, nothing is blocked. Terminals, password
-  managers and browsers are all fair game, so approve with care.
+- **Any app, no prompts.** Every app is allowed without asking, and nothing is
+  blocked. Terminals, password managers and browsers are all fair game.
 - **Esc stops the agent.** Every further call returns the original's "stopped by
   the user" message, until the agent has been idle for 30 seconds.
 - **Locked screen.** Nothing is read while the Mac is locked.

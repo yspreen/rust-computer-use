@@ -15,7 +15,7 @@ use core_foundation_sys::dictionary::CFDictionaryGetValue;
 use core_foundation_sys::number::{kCFNumberFloat64Type, CFNumberGetValue};
 use input::Pt;
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
 use std::process::Command;
 
@@ -33,37 +33,18 @@ extern "C" {
     fn CGSessionCopyCurrentDictionary() -> *const std::ffi::c_void;
 }
 
-/// JSON-RPC, one message per line. Server-initiated requests (elicitation) wait for their
-/// reply and queue anything else that arrives meanwhile.
+/// JSON-RPC, one message per line.
 struct Io {
     lines: std::io::Lines<Box<dyn BufRead + Send>>,
     out: Box<dyn Write + Send>,
-    queue: VecDeque<Value>,
-    next_id: u64,
 }
 
 impl Io {
     fn next(&mut self) -> Option<Value> {
-        if let Some(m) = self.queue.pop_front() {
-            return Some(m);
-        }
         loop {
             if let Ok(m) = serde_json::from_str(&self.lines.next()?.ok()?) {
                 return Some(m);
             }
-        }
-    }
-
-    fn request(&mut self, method: &str, params: Value) -> Option<Value> {
-        self.next_id += 1;
-        let id = format!("rust-computer-use-{}", self.next_id);
-        self.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
-        loop {
-            let m: Value = serde_json::from_str(&self.lines.next()?.ok()?).ok()?;
-            if m["id"] == json!(id) && m.get("method").is_none() {
-                return Some(m);
-            }
-            self.queue.push_back(m);
         }
     }
 
@@ -76,15 +57,8 @@ impl Io {
 struct Server {
     io: Io,
     snaps: HashMap<i32, Snapshot>,
-    can_elicit: bool,
-    approved: HashSet<String>,
     /// Apps whose instructions this session already delivered; the original sends them once.
     instructed: HashSet<String>,
-}
-
-fn approvals_path() -> std::path::PathBuf {
-    let home = std::env::var_os("HOME").unwrap_or_default();
-    std::path::Path::new(&home).join("Library/Application Support/rust-computer-use/approvals.json")
 }
 
 fn main() {
@@ -123,15 +97,9 @@ fn main() {
 }
 
 fn serve(input: Box<dyn BufRead + Send>, out: Box<dyn Write + Send>) {
-    let saved = std::fs::read_to_string(approvals_path()).unwrap_or_default();
-    let approved = serde_json::from_str::<Value>(&saved).ok().and_then(|v| {
-        v["approvedBundleIdentifiers"].as_array().map(|a| a.iter().filter_map(|b| b.as_str().map(String::from)).collect())
-    });
     let mut srv = Server {
-        io: Io { lines: input.lines(), out, queue: VecDeque::new(), next_id: 0 },
+        io: Io { lines: input.lines(), out },
         snaps: HashMap::new(),
-        can_elicit: false,
-        approved: approved.unwrap_or_default(),
         instructed: HashSet::new(),
     };
     while let Some(msg) = srv.io.next() {
@@ -140,7 +108,6 @@ fn serve(input: Box<dyn BufRead + Send>, out: Box<dyn Write + Send>) {
         };
         let result = match msg["method"].as_str().unwrap_or("") {
             "initialize" => {
-                srv.can_elicit = msg["params"]["capabilities"].get("elicitation").is_some();
                 json!({
                     "protocolVersion": msg["params"]["protocolVersion"].as_str().unwrap_or("2025-06-18"),
                     "capabilities": {"tools": {}},
@@ -265,42 +232,6 @@ fn screen_locked() -> bool {
     }
 }
 
-/// First use of an app asks the user through MCP elicitation; the answer is remembered.
-fn approve(srv: &mut Server, app: &apps::App, q: &str) -> Result<(), String> {
-    if srv.approved.contains(&app.bundle_id) || std::env::var_os("RUST_COMPUTER_USE_APPROVE_ALL").is_some() {
-        return Ok(());
-    }
-    if !srv.can_elicit {
-        return Err(format!("Computer Use needs the user's approval to use the app '{q}', but this MCP client does not support elicitation. Set RUST_COMPUTER_USE_APPROVE_ALL=1 to allow every app."));
-    }
-    let params = json!({"message": format!("Allow Rust Computer Use to use {}?", app.name), "requestedSchema": {"type": "object", "properties": {}}});
-    let answer = srv.io.request("elicitation/create", params);
-    match answer.as_ref().and_then(|r| r["result"]["action"].as_str()) {
-        Some("accept") => {
-            // Approved for this session; kept across sessions only when the client says so.
-            srv.approved.insert(app.bundle_id.clone());
-            if answer.as_ref().is_some_and(|r| r["result"]["_meta"]["persist"] == "always") {
-                let path = approvals_path();
-                let saved = std::fs::read_to_string(&path).unwrap_or_default();
-                let mut ids: Vec<String> = serde_json::from_str::<Value>(&saved).ok()
-                    .and_then(|v| serde_json::from_value(v["approvedBundleIdentifiers"].clone()).ok())
-                    .unwrap_or_default();
-                ids.push(app.bundle_id.clone());
-                ids.sort();
-                ids.dedup();
-                let written = std::fs::create_dir_all(path.parent().unwrap())
-                    .and_then(|_| std::fs::write(&path, json!({"approvedBundleIdentifiers": ids}).to_string()));
-                if written.is_err() {
-                    return Err(format!("Computer Use could not persist the approval permanently for app '{q}'."));
-                }
-            }
-            Ok(())
-        }
-        Some("decline") => Err(format!("Computer Use approval denied via MCP elicitation for app '{q}'.")),
-        _ => Err(format!("Computer Use permission request canceled for app '{q}'.")),
-    }
-}
-
 fn call(srv: &mut Server, name: &str, a: &Value) -> Result<Value, String> {
     validate(name, a)?;
     if overlay::stopped() {
@@ -316,7 +247,6 @@ fn call(srv: &mut Server, name: &str, a: &Value) -> Result<Value, String> {
     let q = a["app"].as_str().unwrap_or("");
     let app = apps::resolve(q)?;
     if name == "get_app_state" {
-        approve(srv, &app, q)?;
         let notes = if srv.instructed.insert(app.bundle_id.clone()) { instructions(&app) } else { String::new() };
         return state(&mut srv.snaps, &app, Some(notes));
     }

@@ -88,7 +88,9 @@ fn approvals_path() -> std::path::PathBuf {
 }
 
 fn main() {
-    input::warm(); // keyboard layout lookups must happen on the main thread
+    if std::env::args().any(|a| a == "--probe-screen") {
+        std::process::exit(if setup::screen_recording_now() { 0 } else { 1 });
+    }
     let setup = std::env::args().any(|a| a == "--setup");
     let bundle = service::bundle();
     if let Some(app) = bundle.as_ref().filter(|_| !service::launched_by_launch_services()) {
@@ -102,6 +104,7 @@ fn main() {
         }
         std::process::exit(0);
     }
+    input::warm(); // keyboard layout lookups must happen on the main thread
     // Opened from Finder (no arguments) the app walks through the permissions.
     let service = std::env::args().any(|a| a == "--service");
     if setup || (bundle.is_some() && !service) {

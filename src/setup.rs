@@ -51,9 +51,34 @@ const PERMISSIONS: [Permission; 2] = [
         icon: "/System/Applications/Utilities/Screenshot.app",
         icon_size: 44.0,
         anchor: "Privacy_ScreenCapture",
-        granted: || unsafe { CGPreflightScreenCaptureAccess() },
+        granted: screen_recording,
     },
 ];
+
+/// A process sees a Screen Recording grant only if it started after it (System Settings
+/// offers "Quit & Reopen" for that). So while this process still reads "no", ask a fresh
+/// child, at most every two seconds, and remember a yes.
+fn screen_recording() -> bool {
+    static KNOWN: AtomicBool = AtomicBool::new(false);
+    static ASKED: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    if KNOWN.load(Relaxed) || screen_recording_now() {
+        return true;
+    }
+    let mut asked = ASKED.lock().unwrap();
+    if asked.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(2)) {
+        return false;
+    }
+    *asked = Some(std::time::Instant::now());
+    let fresh = std::env::current_exe()
+        .and_then(|exe| std::process::Command::new(exe).arg("--probe-screen").status())
+        .is_ok_and(|s| s.success());
+    KNOWN.store(fresh, Relaxed);
+    fresh
+}
+
+pub fn screen_recording_now() -> bool {
+    unsafe { CGPreflightScreenCaptureAccess() }
+}
 
 pub fn all_granted() -> bool {
     PERMISSIONS.iter().all(|p| (p.granted)())

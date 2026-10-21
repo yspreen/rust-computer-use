@@ -38,6 +38,12 @@ extern "C" {
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
     fn AXValueGetValue(v: *const c_void, t: u32, out: *mut c_void) -> bool;
+    fn GetProcessForPID(pid: i32, psn: *mut [u32; 2]) -> i32;
+}
+
+extern "C" {
+    fn dlopen(path: *const i8, mode: i32) -> *mut c_void;
+    fn dlsym(handle: *mut c_void, name: *const i8) -> *mut c_void;
 }
 
 #[link(name = "Carbon", kind = "framework")]
@@ -84,6 +90,23 @@ pub fn believe_active(pid: i32, activation: Option<Pt>) {
     // first key follows about 8 ms later).
     pause(10);
     b.push(pid);
+}
+
+/// Put `pid` back in front. An app that believes it is active can bring itself forward (Chrome
+/// does on super+l); the original then hands the front back with SkyLight's
+/// SetFrontProcessWithOptions, as if the user had done it.
+pub fn set_front(pid: i32) {
+    type SetFront = unsafe extern "C" fn(*const [u32; 2], u32, u32) -> i32;
+    static F: OnceLock<usize> = OnceLock::new();
+    let f = *F.get_or_init(|| unsafe {
+        let lib = dlopen(c"/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight".as_ptr(), 1);
+        if lib.is_null() { 0 } else { dlsym(lib, c"_SLPSSetFrontProcessWithOptions".as_ptr()) as usize }
+    });
+    let mut psn = [0u32; 2];
+    if f != 0 && unsafe { GetProcessForPID(pid, &mut psn) } == 0 {
+        let f: SetFront = unsafe { std::mem::transmute(f) };
+        unsafe { f(&psn, 0, 0x200) }; // kCPSUserGenerated
+    }
 }
 
 /// Undo believe_active for every app (at the end of the session).

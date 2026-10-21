@@ -98,7 +98,15 @@ define_class!(
                 NSDraggingItem::alloc(),
                 ProtocolObject::from_ref(&*self.ivars().url),
             );
-            unsafe { item.setDraggingFrame_contents(self.bounds(), Some(&self.ivars().icon)) };
+            // The whole row follows the pointer, as in the original.
+            let snapshot = self.bitmapImageRepForCachingDisplayInRect(self.bounds()).map(|rep| {
+                self.cacheDisplayInRect_toBitmapImageRep(self.bounds(), &rep);
+                let image = NSImage::initWithSize(NSImage::alloc(), self.bounds().size);
+                image.addRepresentation(&rep);
+                image
+            });
+            let contents = snapshot.unwrap_or_else(|| self.ivars().icon.clone());
+            unsafe { item.setDraggingFrame_contents(self.bounds(), Some(&contents)) };
             let items = NSArray::from_retained_slice(&[item]);
             let session = self.beginDraggingSessionWithItems_event_source(&items, event, ProtocolObject::from_ref(self));
             session.setAnimatesToStartingPositionsOnCancelOrFail(true);
@@ -107,6 +115,18 @@ define_class!(
         #[unsafe(method(acceptsFirstMouse:))]
         fn accepts_first_mouse(&self, _event: Option<&NSEvent>) -> bool {
             true // the panel never becomes active, so the first click must count
+        }
+
+        /// The icon and name inside must not take the press: the whole row drags.
+        #[unsafe(method(hitTest:))]
+        fn hit_test(&self, point: NSPoint) -> *mut NSView {
+            let inside: bool = unsafe { msg_send![self, mouse: point, inRect: self.frame()] };
+            if inside { self as *const Self as *mut NSView } else { std::ptr::null_mut() }
+        }
+
+        #[unsafe(method(resetCursorRects))]
+        fn reset_cursor_rects(&self) {
+            self.addCursorRect_cursor(self.bounds(), &NSCursor::openHandCursor());
         }
     }
 
@@ -369,13 +389,13 @@ fn build(mtm: MainThreadMarker, exit_when_done: bool) -> Setup {
     hint_label.setFrame(rect(62.0, 64.0, 450.0, 20.0));
     pane.addSubview(&hint_label);
     let tile = DragTile::alloc(mtm).set_ivars(TileIvars { url: host_url, icon: own.clone() });
-    let tile: Retained<DragTile> = unsafe { msg_send![super(tile), initWithFrame: rect(62.0, 27.0, 300.0, 28.0)] };
+    let tile: Retained<DragTile> = unsafe { msg_send![super(tile), initWithFrame: rect(62.0, 21.0, 451.0, 40.0)] };
     let tile_icon = NSImageView::imageViewWithImage(&own, mtm);
     tile_icon.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
-    tile_icon.setFrame(rect(0.0, 0.0, 28.0, 28.0));
+    tile_icon.setFrame(rect(0.0, 4.0, 32.0, 32.0));
     tile.addSubview(&tile_icon);
     let tile_name = text(&host, NSFont::systemFontOfSize(13.0), true, mtm);
-    tile_name.setFrame(rect(32.0, 5.0, 260.0, 18.0));
+    tile_name.setFrame(rect(36.0, 11.0, 400.0, 18.0));
     tile.addSubview(&tile_name);
     pane.addSubview(&tile);
 

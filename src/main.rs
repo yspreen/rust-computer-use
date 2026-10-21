@@ -12,7 +12,7 @@ use ax::Cf;
 use base64::Engine;
 use core_foundation_sys::array::*;
 use core_foundation_sys::dictionary::CFDictionaryGetValue;
-use core_foundation_sys::number::{kCFNumberFloat64Type, CFNumberGetValue};
+use core_foundation_sys::number::{kCFNumberFloat64Type, kCFNumberSInt32Type, CFNumberGetValue};
 use input::Pt;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -21,6 +21,7 @@ use std::process::Command;
 
 /// What the last get_app_state saw, so later calls can address elements and pixels.
 struct Snapshot {
+    taken: std::time::Instant,
     tree: ax::Tree,
     window: (f64, f64, f64, f64),
     window_id: u32,
@@ -249,9 +250,16 @@ fn call(srv: &mut Server, name: &str, a: &Value) -> Result<Value, String> {
     let Some(snap) = srv.snaps.get(&app.pid) else {
         return Ok(text(format!("Computer Use is not active for '{q}'. You first must call `get_app_state` to get the latest state before doing other Computer Use actions. If `get_app_state` is not available in your environment, use `tool_search` to surface it.")));
     };
-    // Like the original, refuse to act on a stale view: the agent must look again first.
-    if render(&app)?.0.text != snap.tree.text {
-        return Err(format!("The user changed '{}'. Re-query the latest state with `get_app_state` before sending more actions.", app.name));
+    // Like the original, refuse to act while the user is using the app, and after they used it
+    // since the last get_app_state. Changes the app makes by itself don't count.
+    if let Some(t) = overlay::touched(app.pid) {
+        let wait = USER_DEBOUNCE.saturating_sub(t.elapsed());
+        if !wait.is_zero() {
+            return Err(format!("The user is still interacting with '{}'. Wait {} seconds and retry.", app.name, wait.as_secs_f64().ceil()));
+        }
+        if t > snap.taken {
+            return Err(format!("The user changed '{}'. Re-query the latest state with `get_app_state` before sending more actions.", app.name));
+        }
     }
     input::target(app.pid, snap.window_id, Pt { x: snap.window.0, y: snap.window.1 });
     act(snap, name, a, &app)?;
@@ -399,6 +407,9 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App) -> Result<(), St
 
 /// The original's build number, which its state header reports.
 const CUA_VERSION: u32 = 1001501;
+/// How long after the user's last input the app counts as in use. The original's value is set
+/// where its binary has no symbols; this is a guess.
+const USER_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Wait for the app to settle like the original: watch its AX notifications, polling every
 /// 0.1 s, until 0.25 s pass without one (at most 5 s).
@@ -514,7 +525,7 @@ fn state(snaps: &mut HashMap<i32, Snapshot>, app: &apps::App, full: bool) -> Res
         }
         Err(e) => content.push(json!({"type": "text", "text": format!("Screenshot unavailable: {e}")})),
     }
-    snaps.insert(app.pid, Snapshot { tree, window: frame, window_id, image });
+    snaps.insert(app.pid, Snapshot { taken: std::time::Instant::now(), tree, window: frame, window_id, image });
     Ok(Value::Array(content))
 }
 
@@ -539,6 +550,18 @@ pub fn windows(pid: i32, on_screen: bool) -> Vec<(u32, (f64, f64, f64, f64))> {
             (num(d, "kCGWindowNumber") as u32, bounds)
         })
         .collect()
+}
+
+/// The process owning a window.
+pub fn window_owner(id: u32) -> Option<i32> {
+    let list = Cf(unsafe { CGWindowListCopyWindowInfo(8, id) } as _); // kCGWindowListOptionIncludingWindow
+    if list.0.is_null() || unsafe { CFArrayGetCount(list.0 as _) } == 0 {
+        return None;
+    }
+    let d = unsafe { CFArrayGetValueAtIndex(list.0 as _, 0) };
+    let v = unsafe { CFDictionaryGetValue(d as _, ax::cfstr("kCGWindowOwnerPID").0) };
+    let mut pid = 0i32;
+    (!v.is_null() && unsafe { CFNumberGetValue(v as _, kCFNumberSInt32Type, &mut pid as *mut i32 as _) }).then_some(pid)
 }
 
 /// The window server's name for a window (kCGWindowName), if it has one.

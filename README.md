@@ -103,10 +103,6 @@ seconds. Your real pointer never moves.
   been quiet for 0.25 s, at most 5 s.
 - **Screenshot:** `screencapture -l<windowID>`, JPEG, at full resolution. It works
   for windows on other Spaces too.
-- **App instructions:** the original's browser note for any app that handles
-  http links. Per-app notes come from the Codex Computer Use app's bundled
-  AppInstructions if it is installed.
-  Each is sent once per session.
 - **`app`** also accepts a pid, which picks one instance when several share a
   bundle ID.
 

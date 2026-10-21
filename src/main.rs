@@ -15,7 +15,7 @@ use core_foundation_sys::dictionary::CFDictionaryGetValue;
 use core_foundation_sys::number::{kCFNumberFloat64Type, CFNumberGetValue};
 use input::Pt;
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::process::Command;
 
@@ -57,8 +57,6 @@ impl Io {
 struct Server {
     io: Io,
     snaps: HashMap<i32, Snapshot>,
-    /// Apps whose instructions this session already delivered; the original sends them once.
-    instructed: HashSet<String>,
 }
 
 fn main() {
@@ -100,7 +98,6 @@ fn serve(input: Box<dyn BufRead + Send>, out: Box<dyn Write + Send>) {
     let mut srv = Server {
         io: Io { lines: input.lines(), out },
         snaps: HashMap::new(),
-        instructed: HashSet::new(),
     };
     while let Some(msg) = srv.io.next() {
         let Some(id) = msg.get("id").cloned().filter(|_| msg.get("method").is_some()) else {
@@ -247,8 +244,7 @@ fn call(srv: &mut Server, name: &str, a: &Value) -> Result<Value, String> {
     let q = a["app"].as_str().unwrap_or("");
     let app = apps::resolve(q)?;
     if name == "get_app_state" {
-        let notes = if srv.instructed.insert(app.bundle_id.clone()) { instructions(&app) } else { String::new() };
-        return state(&mut srv.snaps, &app, Some(notes));
+        return state(&mut srv.snaps, &app, true);
     }
     let Some(snap) = srv.snaps.get(&app.pid) else {
         return Ok(text(format!("Computer Use is not active for '{q}'. You first must call `get_app_state` to get the latest state before doing other Computer Use actions. If `get_app_state` is not available in your environment, use `tool_search` to surface it.")));
@@ -261,7 +257,7 @@ fn call(srv: &mut Server, name: &str, a: &Value) -> Result<Value, String> {
     act(snap, name, a, &app)?;
     // Actions answer with the resulting state once the UI settles, as the original does.
     settle(app.pid);
-    state(&mut srv.snaps, &app, None)
+    state(&mut srv.snaps, &app, false)
         .or_else(|_| Ok(text("Action completed. Call `get_app_state` to fetch the updated UI state.")))
 }
 
@@ -490,51 +486,17 @@ fn render(app: &apps::App) -> Result<(ax::Tree, Cf), String> {
     Ok((tree, win))
 }
 
-const BROWSER_NOTES: &str = "## Browser Computer Use\n\nWhen navigating to a new website or starting a separate web task, prefer opening a new tab instead of reusing the current tab; reuse the current tab only when the user explicitly asks to continue there or when the current page is clearly the right place to continue the existing workflow.";
-
-/// Per-app guidance, assembled like the original: the browser note for any app that handles
-/// http URLs, then the first `<name>.md` found for the app's candidate names (Music's file is
-/// "AppleMusic", then CFBundleName, then the bundle id). Files come from the Codex Computer
-/// Use app's bundled AppInstructions.
-fn instructions(app: &apps::App) -> String {
-    let bundle = objc2_foundation::NSBundle::bundleWithPath(&objc2_foundation::NSString::from_str(&app.path));
-    let info = |k: &str| bundle.as_ref().and_then(|b| b.objectForInfoDictionaryKey(&objc2_foundation::NSString::from_str(k)));
-    let mut names: Vec<String> = vec![];
-    if app.bundle_id == "com.apple.Music" {
-        names.push("AppleMusic".into());
-    }
-    names.extend(info("CFBundleName").and_then(|n| n.downcast::<objc2_foundation::NSString>().ok()).map(|n| n.to_string()));
-    names.push(app.bundle_id.clone());
-    let home = std::env::var("HOME").unwrap_or_default();
-    let dirs = [
-        format!("{home}/.codex/computer-use/Codex Computer Use.app/Contents/Resources/Package_ComputerUse.bundle/Contents/Resources/AppInstructions"),
-    ];
-    let mut parts: Vec<String> = vec![];
-    if apps::handles_http(&app.path) {
-        parts.push(BROWSER_NOTES.into());
-    }
-    let file = names.iter().find_map(|n| {
-        dirs.iter().find_map(|d| std::fs::read_to_string(format!("{d}/{n}.md")).ok()).filter(|t| !t.is_empty())
-    });
-    parts.extend(file);
-    if parts.is_empty() {
-        return String::new();
-    }
-    format!("<app_specific_instructions>\n{}\n</app_specific_instructions>\n", parts.join("\n\n"))
-}
-
-/// get_app_state passes its instructions (possibly empty) for the full framing; actions pass
-/// None and get the shorter one.
-fn state(snaps: &mut HashMap<i32, Snapshot>, app: &apps::App, notes: Option<String>) -> Result<Value, String> {
+/// get_app_state gets the full framing; actions get the shorter one.
+fn state(snaps: &mut HashMap<i32, Snapshot>, app: &apps::App, full: bool) -> Result<Value, String> {
     let (tree, win) = render(app)?;
     let frame = ax::frame(win.0).ok_or(server_err("window has no frame"))?;
     let window_id = window_id(app.pid, frame).unwrap_or(0);
     // The window server's title first (Chrome's omits the app name), then the AX title.
     let title = window_name(window_id).or_else(|| ax::attr_str(win.0, "AXTitle")).unwrap_or_default();
     let window = format!("Window: \"{title}\", App: {}.\n{}", app.name, tree.text);
-    let body = if let Some(notes) = notes {
+    let body = if full {
         format!(
-            "Computer Use state (CUA App Version: {CUA_VERSION})\n{notes}<app_state>\nApp={}/ (bundleID {}, pid {})\n{window}</app_state>",
+            "Computer Use state (CUA App Version: {CUA_VERSION})\n<app_state>\nApp={}/ (bundleID {}, pid {})\n{window}</app_state>",
             app.path, app.bundle_id, app.pid
         )
     } else {

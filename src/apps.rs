@@ -30,22 +30,6 @@ pub fn running() -> Vec<App> {
         .collect()
 }
 
-/// Whether the app registers the http URL scheme (CFBundleURLTypes), the original's browser test.
-pub fn handles_http(path: &str) -> bool {
-    let Some(types) = NSBundle::bundleWithPath(&NSString::from_str(path))
-        .and_then(|b| b.objectForInfoDictionaryKey(&NSString::from_str("CFBundleURLTypes")))
-        .and_then(|t| t.downcast::<objc2_foundation::NSArray>().ok())
-    else {
-        return false;
-    };
-    let key = NSString::from_str("CFBundleURLSchemes");
-    types.iter().filter_map(|t| t.downcast::<objc2_foundation::NSDictionary>().ok()).any(|d| {
-        d.objectForKey(&key)
-            .and_then(|s| s.downcast::<objc2_foundation::NSArray>().ok())
-            .is_some_and(|s| s.iter().any(|x| x.downcast_ref::<NSString>().is_some_and(|x| x.to_string().eq_ignore_ascii_case("http"))))
-    })
-}
-
 /// Chromium and Electron apps ship a "<Name> Framework" with Chromium's resource packs.
 pub fn chromium(path: &str) -> bool {
     std::fs::read_dir(format!("{path}/Contents/Frameworks")).into_iter().flatten().flatten().any(|f| {

@@ -446,9 +446,9 @@ fn render(app: &apps::App) -> Result<(ax::Tree, Cf), String> {
         return Ok((tree, win));
     }
     ax::render(win.0, 0, usize::MAX, &mut tree);
-    // Chromium builds its web tree lazily (first request, or after dropping it in the
-    // background): give it up to 3 s to show page content, and a nearly empty window too.
-    let web = apps::chromium(&app.path) && ax::enable_web(app.pid);
+    // Chromium and Firefox build their web trees lazily (first request, or after dropping it
+    // in the background): give it up to 3 s to show page content, and a nearly empty window too.
+    let web = apps::web_engine(&app.path) && ax::enable_web(app.pid);
     for _ in 0..12 {
         if (!web || tree.web_areas > 0) && tree.elems.len() >= 8 {
             break;

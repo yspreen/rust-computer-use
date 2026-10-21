@@ -117,10 +117,10 @@ pub fn app_element(pid: i32) -> Cf {
 /// Apps whose web accessibility this process switched on, and the attribute it used.
 static ENABLED: std::sync::Mutex<Vec<(i32, &'static str)>> = std::sync::Mutex::new(Vec::new());
 
-/// Chromium/Electron only build their web trees when asked. Like the original, use
+/// Chromium/Electron/Firefox only build their web trees when asked. Like the original, use
 /// AXManualAccessibility when the app lists it (Electron), else AXEnhancedUserInterface
-/// (Chrome). The flag is set on every read: Chrome can drop its web tree while still reporting
-/// the flag on, and only a fresh write brings it back. True for apps that take either flag.
+/// (Chrome, Firefox). The flag is set on every read: Chrome can drop its web tree while still
+/// reporting the flag on, and only a fresh write brings it back. True for apps that take either flag.
 pub fn enable_web(pid: i32) -> bool {
     let app = app_element(pid);
     let mut names: CFArrayRef = std::ptr::null();

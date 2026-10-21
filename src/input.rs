@@ -150,7 +150,8 @@ fn address(e: Ev, p: Pt) -> Ev {
 }
 
 /// A mouse event the way the original builds them: event number (field 0), click state (1),
-/// pressure 1.0 (2), button number (3) and mouse subtype 3 (7).
+/// pressure 1.0 (2), button number (3), mouse subtype 3 (7) and no modifiers, so a key the
+/// user holds can't turn a click into a control-click.
 fn mouse(ty: u32, p: Pt, button: u32, number: i64, clicks: i64) -> Ev {
     let e = address(unsafe { CGEventCreateMouseEvent(std::ptr::null(), ty, p, button) }, p);
     unsafe {
@@ -159,6 +160,7 @@ fn mouse(ty: u32, p: Pt, button: u32, number: i64, clicks: i64) -> Ev {
         CGEventSetDoubleValueField(e, 2, 1.0);
         CGEventSetIntegerValueField(e, 3, button as i64);
         CGEventSetIntegerValueField(e, 7, 3);
+        CGEventSetFlags(e, 0);
     }
     e
 }

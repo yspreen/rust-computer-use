@@ -30,9 +30,11 @@ pub fn running() -> Vec<App> {
         .collect()
 }
 
-/// Chromium and Electron apps ship a "<Name> Framework" with Chromium's resource packs.
-pub fn chromium(path: &str) -> bool {
-    std::fs::read_dir(format!("{path}/Contents/Frameworks")).into_iter().flatten().flatten().any(|f| {
+/// Apps whose web content needs an accessibility flag before it shows up: Chromium and
+/// Electron (a "<Name> Framework" with Chromium's resource packs) and Gecko (XUL).
+pub fn web_engine(path: &str) -> bool {
+    std::path::Path::new(&format!("{path}/Contents/MacOS/XUL")).exists()
+        || std::fs::read_dir(format!("{path}/Contents/Frameworks")).into_iter().flatten().flatten().any(|f| {
         f.path().join("Resources/chrome_100_percent.pak").exists()
     })
 }

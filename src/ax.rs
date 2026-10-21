@@ -6,7 +6,7 @@ use core_foundation_sys::string::*;
 use std::ffi::c_void;
 
 pub type AXRef = *const c_void;
-const MAX_NODES: usize = 2000;
+const MAX_NODES: usize = 12000;
 
 /// Display names for standard actions; anything else shows its AX description.
 const STANDARD_ACTIONS: &[(&str, &str)] = &[
@@ -28,6 +28,8 @@ extern "C" {
     fn AXUIElementCopyAttributeValue(e: AXRef, a: CFStringRef, v: *mut CFTypeRef) -> i32;
     fn AXUIElementSetAttributeValue(e: AXRef, a: CFStringRef, v: CFTypeRef) -> i32;
     fn AXUIElementCopyAttributeNames(e: AXRef, v: *mut CFArrayRef) -> i32;
+    fn AXUIElementCopyMultipleAttributeValues(e: AXRef, names: CFArrayRef, opts: u32, v: *mut CFArrayRef) -> i32;
+    fn AXValueGetTypeID() -> CFTypeID;
     fn AXUIElementCopyActionNames(e: AXRef, v: *mut CFArrayRef) -> i32;
     fn AXUIElementCopyActionDescription(e: AXRef, a: CFStringRef, v: *mut CFStringRef) -> i32;
     fn AXUIElementIsAttributeSettable(e: AXRef, a: CFStringRef, out: *mut bool) -> i32;
@@ -93,7 +95,10 @@ pub fn to_string(v: CFTypeRef) -> Option<String> {
                     .to_string(),
             )
         } else if t == core_foundation_sys::url::CFURLGetTypeID() {
-            to_string(core_foundation_sys::url::CFURLGetString(v as _) as _)
+            // Finder hands out file reference URLs (file:///.file/id=…); show the path URL.
+            let path = Cf(core_foundation_sys::url::CFURLCreateFilePathURL(null(), v as _, std::ptr::null_mut()) as _);
+            let url = if path.0.is_null() { v } else { path.0 };
+            to_string(core_foundation_sys::url::CFURLGetString(url as _) as _)
         } else if t == core_foundation_sys::number::CFBooleanGetTypeID() {
             Some(if CFBooleanGetValue(v as _) { "on" } else { "off" }.into())
         } else {
@@ -150,73 +155,11 @@ pub fn attr(e: AXRef, name: &str) -> Option<Cf> {
 pub fn attr_str(e: AXRef, name: &str) -> Option<String> {
     attr(e, name).and_then(|v| to_string(v.0))
 }
-/// Type flag for a settable value: "boolean", "integer" or "float"; strings have none.
-fn value_kind(e: AXRef) -> Option<&'static str> {
-    let v = attr(e, "AXValue")?;
-    unsafe {
-        let t = CFGetTypeID(v.0);
-        if t == CFBooleanGetTypeID() {
-            Some("boolean")
-        } else if t == CFNumberGetTypeID() {
-            Some(if CFNumberIsFloatType(v.0 as _) != 0 { "float" } else { "integer" })
-        } else {
-            None
-        }
-    }
-}
-
-/// Identifiers AppKit generates itself ("_NS:12", "NSOutlineViewDisclosureButtonKey") say
-/// nothing about the app, so the original omits them.
-fn appkit_id(id: &str) -> bool {
-    id.starts_with("_NS:") || (id.starts_with("NS") && id[2..].starts_with(|c: char| c.is_ascii_uppercase()))
-}
-
-/// Web links display without their scheme ("example.com/"); other URLs stay whole.
+/// Web URLs display without their scheme or "www." ("example.com/"); others stay whole.
 pub fn short_url(url: &str) -> &str {
-    url.strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .unwrap_or(url)
+    let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"));
+    rest.map_or(url, |r| r.strip_prefix("www.").unwrap_or(r))
 }
-/// What a table row shows: its cells' text as the value (one cell per line), the title and
-/// description of a button inside a cell, and its disclosure triangles as the only children.
-struct RowParts {
-    value: Option<String>,
-    title: Option<String>,
-    desc: Option<String>,
-    triangles: Vec<Cf>,
-}
-
-fn row_parts(row: AXRef) -> RowParts {
-    fn walk(e: AXRef, text: &mut String, parts: &mut RowParts) {
-        let kids = attr(e, "AXChildren");
-        for c in kids.as_ref().map(array).unwrap_or_default() {
-            match attr_str(c, "AXRole").as_deref() {
-                Some("AXStaticText" | "AXTextField") => text.push_str(&attr_str(c, "AXValue").unwrap_or_default()),
-                Some("AXDisclosureTriangle") => parts.triangles.push(Cf(unsafe { CFRetain(c) })),
-                Some("AXButton") if parts.title.is_none() => {
-                    parts.title = attr_str(c, "AXTitle");
-                    parts.desc = attr_str(c, "AXDescription").or(parts.desc.take());
-                }
-                Some("AXImage") if parts.desc.is_none() => parts.desc = attr_str(c, "AXDescription"),
-                _ => {}
-            }
-            walk(c, text, parts);
-        }
-    }
-    let mut parts = RowParts { value: None, title: None, desc: None, triangles: vec![] };
-    let kids = attr(row, "AXChildren");
-    let mut cells = vec![];
-    for cell in kids.as_ref().map(array).unwrap_or_default() {
-        let mut text = String::new();
-        walk(cell, &mut text, &mut parts);
-        if !text.is_empty() {
-            cells.push(text);
-        }
-    }
-    parts.value = (!cells.is_empty()).then(|| cells.join("\n"));
-    parts
-}
-
 pub fn settable(e: AXRef, name: &str) -> bool {
     let mut ok = false;
     let n = cfstr(name);
@@ -330,224 +273,408 @@ pub struct Tree {
     pub lines: Vec<String>,
 }
 
-fn shown_action(name: &str, role: &str) -> bool {
-    // Menus: items show nothing, menus offer Cancel, an open menu bar item Cancel and Pick
-    // (render() only descends into a menu bar item while its menu is open).
-    match role {
-        "AXMenuItem" | "AXMenuBar" => return false,
-        "AXMenu" => return name == "AXCancel",
-        "AXMenuBarItem" => return matches!(name, "AXCancel" | "AXPick"),
-        _ => {}
-    }
-    match name {
-        "AXPress" | "AXShowMenu" | "AXPick" | "AXScrollToVisible" | "AXShowDefaultUI" | "AXShowAlternateUI" => false,
-                "AXConfirm" => role != "AXTextField",
-        _ => true,
-    }
+
+/// Attributes read for every element, in one round trip.
+const ATTRS: [&str; 21] = [
+    "AXRole", "AXSubrole", "AXRoleDescription", "AXTitle", "AXDescription", "AXValue", "AXPlaceholderValue",
+    "AXHelp", "AXURL", "AXDocument", "AXIdentifier", "AXValueDescription", "AXSelected", "AXFocused", "AXEnabled",
+    "AXDisclosing", "AXChildren", "AXVerticalScrollBar", "AXHorizontalScrollBar", "AXRows", "AXVisibleRows",
+];
+
+thread_local! {
+    static ATTR_ARRAY: Cf = {
+        let names: Vec<Cf> = ATTRS.iter().map(|a| cfstr(a)).collect();
+        let ptrs: Vec<CFTypeRef> = names.iter().map(|n| n.0).collect();
+        Cf(unsafe { CFArrayCreate(null(), ptrs.as_ptr() as _, ptrs.len() as _, &kCFTypeArrayCallBacks) } as _)
+    };
 }
 
-/// Follow bare containers (no label, value, identifier or visible actions) that hold exactly
-/// one element down to that element.
-fn unwrap_group(e: AXRef) -> Cf {
-    let mut e = Cf(unsafe { CFRetain(e) });
-    loop {
-        let bare = attr_str(e.0, "AXRole").as_deref() == Some("AXGroup")
-            && ["AXTitle", "AXDescription", "AXValue", "AXHelp"].iter().all(|k| attr_str(e.0, k).is_none())
-            && attr_str(e.0, "AXIdentifier").is_none_or(|i| appkit_id(&i))
-            && actions(e.0).iter().all(|(n, _)| !shown_action(n, "AXGroup"));
-        let kids = attr(e.0, "AXChildren");
-        let kids = kids.as_ref().map(array).unwrap_or_default();
-        if !bare || kids.len() != 1 {
-            return e;
-        }
-        e = Cf(unsafe { CFRetain(kids[0]) });
-    }
+/// One element as the original's tree transforms see it.
+struct Node {
+    elem: Cf,
+    role: String,
+    subrole: String,
+    role_desc: Option<String>,
+    title: Option<String>,
+    desc: Option<String>,
+    value: Option<String>,
+    /// "string", "boolean", "integer" or "float": the CF type of AXValue.
+    value_type: Option<&'static str>,
+    placeholder: Option<String>,
+    help: Option<String>,
+    url: Option<String>,
+    id: Option<String>,
+    details: Option<String>,
+    selectable: bool,
+    selected: bool,
+    focusable: bool,
+    focused: bool,
+    enabled: bool,
+    value_settable: bool,
+    /// AXDisclosing, only where it is settable (the original's "disclosable").
+    disclosing: Option<bool>,
+    /// Checkboxes and switches, which survive row flattening.
+    boolean: bool,
+    /// Labels listed as Secondary Actions.
+    actions: Vec<String>,
+    /// Some action survives filtering besides AXShowMenu and AXScrollToVisible.
+    interesting: bool,
+    /// Listed row ranges and the row count, when only the visible part of a long table is shown.
+    subset: Option<(Vec<(usize, usize)>, usize)>,
+    children: Vec<Node>,
 }
 
-/// A bare label: static text with no visible actions, description, help or identifier.
-fn plain_text(e: AXRef) -> bool {
-    attr_str(e, "AXRole").as_deref() == Some("AXStaticText")
-        && actions(e).iter().all(|(n, _)| !shown_action(n, "AXStaticText"))
-        && ["AXDescription", "AXHelp", "AXTitle"].iter().all(|k| attr_str(e, k).is_none())
-        && attr_str(e, "AXIdentifier").is_none_or(|i| appkit_id(&i))
+fn is_true(v: &Option<String>) -> bool {
+    matches!(v.as_deref(), Some("on" | "1"))
 }
 
-/// Render the tree in the Computer Use text format.
-pub fn render(root: AXRef, depth: usize, max_depth: usize, tree: &mut Tree) {
-    if tree.elems.len() >= MAX_NODES || depth > 60 {
-        return;
-    }
-    let role = attr_str(root, "AXRole").unwrap_or_default();
-    let mut title = attr_str(root, "AXTitle");
+fn filled(v: &Option<String>) -> bool {
+    v.as_ref().is_some_and(|v| !v.trim().is_empty())
+}
+
+/// Read an element and (up to `max_depth`) its descendants. None for what the original never
+/// shows: the Apple menu and menu separators.
+fn fetch(e: AXRef, depth: usize, max_depth: usize, budget: &mut usize) -> Option<Node> {
+    *budget = budget.saturating_sub(1);
+    let mut vals: CFArrayRef = std::ptr::null();
+    ATTR_ARRAY.with(|names| unsafe { AXUIElementCopyMultipleAttributeValues(e, names.0 as _, 0, &mut vals) });
+    let vals = Cf(vals as _);
+    let got = if vals.0.is_null() { vec![] } else { array(&vals) };
+    // Missing attributes come back as AXValue error objects.
+    let raw = |i: usize| got.get(i).copied().filter(|v| !v.is_null() && unsafe { CFGetTypeID(*v) != AXValueGetTypeID() });
+    let text = |i: usize| raw(i).and_then(to_string).filter(|s| !s.is_empty());
+    let kids = |i: usize| raw(i).map(|v| array(&Cf(unsafe { CFRetain(v) }))).unwrap_or_default();
+    let role = text(0).unwrap_or_default();
+    let title = text(3);
     if role == "AXMenuBarItem" && title.as_deref() == Some("Apple") {
-        return;
+        return None;
     }
-    // Only multi-line text areas carry styling worth showing; fields read as plain values.
-    let mut value = if role == "AXTextArea" {
-        crate::text::markdown(root)
-            .map(|m| m.text)
-            .filter(|t| !t.is_empty())
-    } else {
-        attr_str(root, "AXValue")
-            .or_else(|| attr_str(root, "AXURL").filter(|_| role == "AXLink"))
-            .map(|v| {
-                if role == "AXLink" {
-                    short_url(&v).to_string()
-                } else {
-                    v
-                }
-            })
+    let children_raw = if depth < max_depth { kids(16) } else { vec![] };
+    if role == "AXMenuItem" && title.is_none() && children_raw.is_empty() {
+        return None;
+    }
+    let value_type = raw(5).and_then(|v| unsafe {
+        let t = CFGetTypeID(v);
+        if t == CFStringGetTypeID() {
+            Some("string")
+        } else if t == CFBooleanGetTypeID() {
+            Some("boolean")
+        } else if t == CFNumberGetTypeID() {
+            Some(if CFNumberIsFloatType(v as _) != 0 { "float" } else { "integer" })
+        } else {
+            None
+        }
+    });
+    let subrole = text(1).unwrap_or_default();
+    // Text areas show their styled text as Markdown; toggle buttons read as on/off.
+    let value = match (role.as_str(), subrole.as_str(), text(5)) {
+        ("AXTextArea", ..) => crate::text::markdown(e).map(|m| m.text).filter(|t| !t.is_empty()),
+        (_, "AXToggle", Some(v)) if v == "0" || v == "1" => Some(if v == "1" { "on" } else { "off" }.into()),
+        (.., v) => v,
     };
-    let mut desc = attr_str(root, "AXDescription");
-    let own_id = attr_str(root, "AXIdentifier").filter(|i| !appkit_id(i));
-    if role == "AXStaticText" && title.is_none() && desc.is_none() && own_id.is_none() {
-        title = value.take();
-    }
-    if role == "AXStaticText" && [&title, &value, &desc].iter().all(|v| v.is_none()) {
-        return; // an empty label shows nothing
-    }
-    let row = (role == "AXRow").then(|| row_parts(root));
-    if let Some(r) = &row {
-        (title, desc, value) = (r.title.clone(), r.desc.clone(), r.value.clone());
-    }
-    let desc = desc.filter(|d| Some(d) != title.as_ref());
-    let help = attr_str(root, "AXHelp");
-    let url = attr_str(root, "AXDocument")
-        .or_else(|| attr_str(root, "AXURL").filter(|_| role != "AXLink"));
-    let id = attr_str(root, "AXIdentifier")
-        .filter(|i| Some(i) != desc.as_ref() && !appkit_id(i));
-    let (vertical, horizontal) = (attr(root, "AXVerticalScrollBar").is_some(), attr(root, "AXHorizontalScrollBar").is_some());
+    // Chromium reports a settable AXValue on everything, empty or label text; like the original,
+    // only a real value or a text input counts, and labels never do.
+    let text_input = matches!(role.as_str(), "AXTextField" | "AXTextArea");
+    let value_settable =
+        role != "AXStaticText" && (value.is_some() || text_input && raw(5).is_some()) && settable(e, "AXValue");
+    let (vertical, horizontal) = (raw(17).is_some(), raw(18).is_some());
     let closed_menu = role == "AXMenuBarItem" && depth >= max_depth;
-    let mut secondary: Vec<_> = actions(root)
+    // The original's filterActions, then only "other" actions are listed: presses, menus and
+    // scroll-to-visible are implied by the role.
+    let kept: Vec<(String, String)> = actions(e)
         .into_iter()
-        .filter(|_| !closed_menu)
         .filter(|(n, _)| match n.as_str() {
-            // Page scrolling shows only along axes that have a scroll bar.
-            "AXScrollUpByPage" | "AXScrollDownByPage" => vertical,
+            _ if closed_menu => false,
+            "AXShowAlternateUI" | "AXShowDefaultUI" => false,
+            "AXCancel" => role != "AXMenuBar" && role != "AXMenuItem",
+            "AXPick" => role != "AXMenuItem",
             "AXScrollLeftByPage" | "AXScrollRightByPage" => horizontal,
-            n => shown_action(n, &role),
+            "AXScrollUpByPage" | "AXScrollDownByPage" => vertical,
+            "AXConfirm" => role != "AXTextField",
+            "AXIncrement" | "AXDecrement" => !value_settable,
+            _ => true,
         })
-        .map(|(_, d)| d)
         .collect();
-    // Outline rows get Collapse/Expand, backed by AXDisclosing (see perform_secondary_action).
-    let disclosing = attr_str(root, "AXDisclosing");
-    match (disclosing.as_deref(), &row) {
-        (Some("on"), _) => secondary.push("Collapse".into()),
-        (Some("off"), Some(r)) if !r.triangles.is_empty() => secondary.push("Expand".into()),
-        _ => {}
+    let interesting = kept.iter().any(|(n, _)| !matches!(n.as_str(), "AXShowMenu" | "AXScrollToVisible"));
+    let mut labels: Vec<String> = kept
+        .into_iter()
+        .filter(|(n, _)| !matches!(n.as_str(), "AXPress" | "AXShowMenu" | "AXScrollToVisible"))
+        .map(|(_, l)| l)
+        .collect();
+    let disclosing = (raw(15).is_some() && settable(e, "AXDisclosing")).then(|| is_true(&text(15)));
+    // Disclosable rows offer the toggle (see perform_secondary_action).
+    labels.extend(disclosing.map(|on| if on { "Collapse" } else { "Expand" }.to_string()));
+    // Tables under 500 rows list every row; longer ones only the visible rows, noted as a subset.
+    let rows = kids(19);
+    let (children_raw, subset) = if depth >= max_depth || rows.is_empty() {
+        (children_raw, None)
+    } else if rows.len() < 500 {
+        (rows, None)
+    } else {
+        let visible = kids(20);
+        let mut ranges: Vec<(usize, usize)> = vec![];
+        for &v in &visible {
+            let i = attr_str(v, "AXIndex").and_then(|i| i.parse().ok())
+                .or_else(|| rows.iter().position(|&r| unsafe { CFEqual(r, v) } != 0)).unwrap_or(0);
+            match ranges.last_mut() {
+                Some(r) if r.1 == i => r.1 = i + 1,
+                _ => ranges.push((i, i + 1)),
+            }
+        }
+        // The original counts at most the first 100 rows of a long table.
+        (visible, Some((ranges, rows.len().min(100))))
+    };
+    let focused_raw = raw(13).is_some();
+    let mut children = vec![];
+    for &c in &children_raw {
+        if *budget == 0 || depth >= 60 {
+            break;
+        }
+        children.extend(fetch(c, depth + 1, max_depth, budget));
+    }
+    let id = text(10).filter(|i| !i.starts_with('_') && !i.starts_with("NS"));
+    let menu = role.starts_with("AXMenu");
+    Some(Node {
+        elem: Cf(unsafe { CFRetain(e) }),
+        subrole,
+        role_desc: text(2),
+        title,
+        desc: text(4),
+        value,
+        value_type,
+        placeholder: text(6),
+        help: text(7),
+        url: text(8).or_else(|| text(9)),
+        id,
+        details: text(11),
+        // Menus track selection for highlighting only; the original never shows it.
+        selectable: !menu && raw(12).is_some() && settable(e, "AXSelected"),
+        selected: !menu && is_true(&text(12)),
+        focusable: focused_raw && settable(e, "AXFocused"),
+        focused: is_true(&text(13)),
+        enabled: !matches!(text(14).as_deref(), Some("off" | "0")),
+        value_settable,
+        disclosing,
+        boolean: value_type == Some("boolean") || role == "AXCheckBox",
+        actions: labels,
+        interesting,
+        subset,
+        children,
+        role,
+    })
+}
+
+impl Node {
+    fn descendants(&self) -> Vec<&Node> {
+        let mut out = vec![];
+        for c in &self.children {
+            out.push(c);
+            out.extend(c.descendants());
+        }
+        out
     }
 
-    if role == "AXMenuItem" && title.is_none() && attr(root, "AXChildren").is_none_or(|k| array(&k).is_empty()) {
-        return; // separator
+    fn any_below(&self, f: impl Fn(&Node) -> bool) -> bool {
+        self.descendants().into_iter().any(f)
     }
-    let kind = match role.as_str() {
-        "AXMenuBarItem" | "AXMenuItem" => None,
-        "AXGroup" => Some("container".to_string()),
-        "AXLink" => Some("link".to_string()),
-        "AXRow" => Some("row".to_string()),
-        _ => attr_str(root, "AXRoleDescription").or(Some(role.clone())),
-    };
-    let mut line =
-        format!("{}", tree.elems.len()) + &kind.map(|k| format!(" {k}")).unwrap_or_default();
-    // Flags follow the role; settable values also name their type.
-    let text_role = matches!(role.as_str(), "AXTextArea" | "AXTextField");
-    let value_settable = (value.is_some() || text_role) && settable(root, "AXValue");
-    let selected = attr_str(root, "AXSelected");
-    // Tables list only the rows on screen, noting the window into the whole list.
-    let rows = attr(root, "AXRows").map(|r| array(&r).len()).unwrap_or(0);
-    let visible = attr(root, "AXVisibleRows");
-    let visible_rows = visible.as_ref().map(array).unwrap_or_default();
-    let first = attr(root, "AXRows").and_then(|r| array(&r).iter().position(|&x| visible_rows.first().is_some_and(|&v| unsafe { CFEqual(x, v) } != 0)));
-    let showing = (visible.is_some() && visible_rows.len() < rows).then(|| {
-        let a = first.unwrap_or(0);
-        format!("showing {a}-{} of {rows} items", a + visible_rows.len())
-    });
-    let flags: Vec<&str> = [
-        (selected.as_deref() == Some("on") && !role.starts_with("AXMenu"), Some("selected")),
-        (selected.as_deref() == Some("off") && !role.starts_with("AXMenu") && settable(root, "AXSelected"), Some("selectable")),
-        (disclosing.as_deref() == Some("on"), Some("expanded")),
-        (showing.is_some(), showing.as_deref()),
-        (attr_str(root, "AXEnabled").as_deref() == Some("off") && !matches!(role.as_str(), "AXStaticText" | "AXGroup"), Some("disabled")),
-        (value_settable, Some("settable")),
-        (value_settable, value_kind(root)),
-    ]
-    .into_iter()
-    .filter_map(|(on, f)| f.filter(|_| on))
-    .collect();
-    if !flags.is_empty() {
-        line += &format!(" ({})", flags.join(", "));
+
+    /// The original's `flattened`: this node's and every descendant's trimmed text, one per line.
+    fn flattened(&self, k: fn(&Node) -> &Option<String>) -> Option<String> {
+        let parts: Vec<&str> = std::iter::once(self).chain(self.descendants()).filter_map(|n| k(n).as_deref()).map(str::trim).filter(|t| !t.is_empty()).collect();
+        (!parts.is_empty()).then(|| parts.join("\n"))
     }
-    if let Some(t) = &title {
-        line += &format!(" {t}");
+
+    fn descriptive(&self) -> bool {
+        [&self.title, &self.desc, &self.value, &self.placeholder].into_iter().any(filled) || self.role == "AXImage"
     }
-    let mut fields: Vec<(&str, Option<String>)> =
-        vec![("Description", desc), ("Help", help), ("URL", url.map(|u| short_url(&u).to_string()))];
-    let details = attr_str(root, "AXValueDescription").filter(|d| Some(d) != value.as_ref());
-    let placeholder = attr_str(root, "AXPlaceholderValue");
-    fields.extend([("Value", value), ("ID", id)]);
-    fields.extend([("Details", details), ("Placeholder", placeholder)]);
-    let mut fields: Vec<String> = fields
+
+    /// Descriptive counting the whole subtree.
+    fn descriptive_deep(&self) -> bool {
+        let k: [fn(&Node) -> &Option<String>; 4] = [|n| &n.title, |n| &n.desc, |n| &n.value, |n| &n.placeholder];
+        k.into_iter().any(|k| self.flattened(k).is_some()) || self.role == "AXImage"
+    }
+
+    fn can_interact(&self) -> bool {
+        match self.role.as_str() {
+            "AXStaticText" => self.focusable || self.selectable,
+            "AXTextArea" | "AXGroup" => self.focusable,
+            _ => true,
+        }
+    }
+
+    fn role_word(&self) -> String {
+        let r = self.role.as_str();
+        match (&self.role_desc, r) {
+            (_, "AXMenuBarItem" | "AXMenuItem" | "AXRadioGroup") => String::new(),
+            (None, "AXMenu") => "menu".into(),
+            (None, "AXMenuBar") => "menu bar".into(),
+            (None, _) => "unknown".into(),
+            (Some(_), "AXRow") => "row".into(),
+            (Some(_), "AXGroup") => "container".into(),
+            (Some(d), _) => d.clone(),
+        }
+    }
+
+    /// The element's line without its index, as the original renders it.
+    fn line(&self) -> String {
+        let subset = self.subset.as_ref().map(|(ranges, n)| {
+            let r: Vec<String> = ranges.iter().map(|(a, b)| format!("{a}-{b}")).collect();
+            format!("(showing {} of {n} items)", r.join(", "))
+        });
+        [self.description(), subset.unwrap_or_default()].into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join(" ")
+    }
+
+    /// Role word, flags and fields: the line minus the row-subset note.
+    fn description(&self) -> String {
+        let flags: Vec<String> = [
+            (self.selectable && !self.selected, "selectable".to_string()),
+            (self.selected, "selected".into()),
+            (!self.enabled && !matches!(self.role.as_str(), "AXGroup" | "AXStaticText"), "disabled".into()),
+            (self.disclosing.is_some(), if self.disclosing == Some(true) { "expanded" } else { "collapsed" }.into()),
+            (self.value_settable && self.value_type.is_some(), match self.value_type {
+                Some("string") | None => "settable".into(),
+                Some(t) => format!("settable, {t}"),
+            }),
+        ]
         .into_iter()
-        .filter_map(|(k, v)| v.map(|v| format!("{k}: {v}")))
+        .filter_map(|(on, f)| on.then_some(f))
         .collect();
-    // Multi-line fields go last so the short ones stay readable.
-    fields.sort_by_key(|f| f.contains('\n'));
-    if title.is_none() && fields.len() == 1 && secondary.is_empty() && !fields[0].starts_with("Placeholder") {
-        fields[0] = fields[0].split_once(": ").unwrap().1.to_string(); // a lone field prints bare
+        let candidates = [
+            (None, self.title.clone()),
+            (Some("Description"), self.desc.clone()),
+            (Some("URL"), self.url.as_deref().map(|u| short_url(u).to_string())),
+            (Some("Help"), self.help.clone()),
+            (Some("Value"), self.value.clone()),
+            (Some("Details"), self.details.clone()),
+            (Some("Placeholder"), self.placeholder.clone()),
+            (Some("ID"), self.id.clone()),
+            (Some("Secondary Actions"), (!self.actions.is_empty()).then(|| self.actions.join(", "))),
+        ];
+        // A field repeating an earlier field's text is left out.
+        let mut seen = std::collections::HashSet::new();
+        let mut fields: Vec<(Option<&str>, String)> = candidates
+            .into_iter()
+            .filter_map(|(k, v)| v.filter(|v| !v.is_empty() && seen.insert(v.clone())).map(|v| (k, v)))
+            .collect();
+        // Long or multi-line fields go last so the short ones stay readable.
+        fields.sort_by_key(|(_, v)| v.chars().count() > 100 || v.contains('\n'));
+        let fields = match fields.as_slice() {
+            [(k, v)] if *k != Some("Secondary Actions") => v.clone(),
+            _ => fields.iter().map(|(k, v)| k.map_or(v.clone(), |k| format!("{k}: {v}"))).collect::<Vec<_>>().join(", "),
+        };
+        let flags = (!flags.is_empty()).then(|| format!("({})", flags.join(", "))).unwrap_or_default();
+        [self.role_word(), flags, fields].into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join(" ")
     }
-    if !secondary.is_empty() {
-        fields.push(format!("Secondary Actions: {}", secondary.join(", ")));
+}
+
+/// The original's transform pipeline for one node, top-down: the node is transformed with its
+/// raw children, then each child in turn. A replacement goes through the whole pipeline again.
+fn transform(mut n: Node) -> Option<Node> {
+    // flattenIntoSelectableAncestor: a selectable row-like element without editable or
+    // selectable parts reads as one line; only its checkboxes stay as children.
+    if n.selectable && !n.focused && n.role != "AXTable" && n.subrole != "AXTableRow" && !n.any_below(|d| d.value_settable || d.selectable) {
+        n.title = n.flattened(|n| &n.title);
+        n.desc = n.flattened(|n| &n.desc);
+        n.value = n.flattened(|n| &n.value);
+        let mut boxes = vec![];
+        let mut stack: Vec<Node> = std::mem::take(&mut n.children).into_iter().rev().collect();
+        while let Some(mut d) = stack.pop() {
+            stack.extend(std::mem::take(&mut d.children).into_iter().rev());
+            if d.boolean {
+                boxes.push(d);
+            }
+        }
+        n.children = boxes;
     }
-    if !fields.is_empty() {
-        line += &format!(
-            "{}{}",
-            if title.is_some() { ", " } else { " " },
-            fields.join(", ")
-        );
+    // pruneNonDescriptiveSubtrees
+    let reachable = |d: &Node| d.focusable || d.selectable || d.interesting;
+    if !reachable(&n) && !n.descriptive_deep() && !n.any_below(reachable) {
+        return None;
     }
-    let empty_group = role == "AXGroup" && line.split(' ').count() == 2; // just "N container"
-    let kids = attr(root, "AXChildren"); // keeps the array (and its elements) alive
-    let children = match (&row, &visible) {
-        (Some(r), _) => r.triangles.iter().map(|t| t.0).collect(),
-        (_, Some(v)) if rows > 0 => array(v),
-        _ => kids.as_ref().map(array).unwrap_or_default(),
-    };
-    if empty_group && children.len() == 1 {
-        // A bare wrapper around one element adds nothing; the original shows the child in its place.
-        return render(children[0], depth, max_depth, tree);
+    // pruneEmptyDisabledElements
+    if !n.enabled && !n.focused && n.children.is_empty() && !n.descriptive_deep() {
+        return None;
     }
-    let (text_len, count) = (tree.text.len(), tree.elems.len());
-    tree.text += &format!("{}{line}\n", "\t".repeat(depth));
-    tree.lines.push(line);
-    tree.elems.push(Cf(unsafe { CFRetain(root) }));
-    if role == "AXWebArea" && !children.is_empty() {
-        tree.web_areas += 1;
+    // mergeSingleItemGroups: a plain group shows its only child in its place, whatever
+    // actions, identifier or help it has.
+    let plain = !n.selectable && !n.focused && !n.descriptive();
+    if plain && n.role == "AXGroup" {
+        if n.children.len() == 1 && n.children[0].subset.is_none() {
+            return transform(n.children.pop().unwrap());
+        }
+        if n.children.is_empty() {
+            return None;
+        }
     }
-    if depth < max_depth {
-        // Look through bare one-child wrappers first, as the collapse rule below would.
-        let held: Vec<Cf> = children.iter().map(|&c| unwrap_group(c)).collect();
-        let children: Vec<CFTypeRef> = held.iter().map(|c| c.0).collect();
-        let mut i = 0;
-        while i < children.len() {
-            // Runs of plain sibling labels read as one line of text, as in the original.
-            let run = children[i..].iter().take_while(|&&c| plain_text(c)).count();
-            if run > 1 {
-                let words: Vec<String> = children[i..i + run].iter().filter_map(|&c| attr_str(c, "AXValue")).collect();
-                let line = format!("{} text {}", tree.elems.len(), words.join(" "));
-                tree.text += &format!("{}{line}\n", "\t".repeat(depth + 1));
-                tree.lines.push(line);
-                tree.elems.push(Cf(unsafe { CFRetain(children[i]) }));
-                i += run;
+    // flattenRedundantHierarchy: a child that would print the same line as its parent is
+    // replaced by its own children.
+    if plain {
+        let line = n.line();
+        let kids = std::mem::take(&mut n.children);
+        for c in kids {
+            if c.role == n.role && c.subset.is_none() && c.line() == line {
+                n.children.extend(c.children);
             } else {
-                render(children[i], depth + 1, max_depth, tree);
-                i += 1;
+                n.children.push(c);
             }
         }
     }
-    if empty_group && tree.elems.len() == count + 1 {
-        // A container with nothing to show is dropped, as the original does.
-        tree.text.truncate(text_len);
-        tree.lines.pop();
-        tree.elems.pop();
+    // flattenRepetitiveStaticText: labels repeating the parent's own text add nothing.
+    if !n.can_interact() && !n.focusable && !n.selectable && !n.any_below(Node::can_interact) {
+        let own: Vec<&str> = [&n.desc, &n.value].into_iter().filter_map(|v| v.as_deref()).map(str::trim).collect();
+        let own: Vec<String> = own.into_iter().map(String::from).collect();
+        n.children.retain(|c| {
+            let t = c.desc.as_ref().or(c.value.as_ref()).map(|t| t.trim().to_string());
+            !(c.role == "AXStaticText" && c.children.is_empty() && t.is_some_and(|t| own.contains(&t)))
+        });
+    }
+    // mergeTextOnlySiblings: runs of sibling labels read as one line of text.
+    if !n.selectable && !n.focusable {
+        let mut merged: Vec<Node> = vec![];
+        let mut run = false;
+        for c in std::mem::take(&mut n.children) {
+            let text = c.role == "AXStaticText" && c.value.is_some();
+            match merged.last_mut() {
+                Some(last) if text && run => {
+                    let v = last.value.take().unwrap_or_default();
+                    last.value = Some(format!("{v} {}", c.value.unwrap_or_default()));
+                }
+                _ => merged.push(c),
+            }
+            run = text;
+        }
+        n.children = merged;
+    }
+    n.children = std::mem::take(&mut n.children).into_iter().filter_map(transform).collect();
+    Some(n)
+}
+
+fn emit(n: Node, depth: usize, tree: &mut Tree) {
+    if n.role == "AXWebArea" && !n.children.is_empty() {
+        tree.web_areas += 1;
+    }
+    let line = n.line();
+    // Something with nothing to say (a radio group) gives its place to its children.
+    let depth = if line.is_empty() {
+        depth
+    } else {
+        let i = tree.elems.len();
+        tree.text += &format!("{}{i} {line}\n", "\t".repeat(depth));
+        // Selection and focus notes quote the line without the subset note.
+        tree.lines.push(format!("{i} {}", n.description()));
+        tree.elems.push(n.elem);
+        depth + 1
+    };
+    for c in n.children {
+        emit(c, depth, tree);
+    }
+}
+
+/// Render the element's tree in the Computer Use text format, indented `depth` tabs and read
+/// `max_depth` levels down.
+pub fn render(root: AXRef, depth: usize, max_depth: usize, tree: &mut Tree) {
+    let mut budget = MAX_NODES;
+    if let Some(n) = fetch(root, 0, max_depth, &mut budget).and_then(transform) {
+        emit(n, depth, tree);
     }
 }

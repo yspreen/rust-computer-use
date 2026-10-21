@@ -481,6 +481,8 @@ fn render(app: &apps::App) -> Result<(ax::Tree, Cf), String> {
         tree.text += &format!("\nSelected text: ```\n{t}\n```\n\n{SELECTION_NOTE}\n");
     } else if let Some(i) = focused.as_ref().and_then(|f| index_of(f.0)) {
         tree.text += &format!("\nThe focused UI element is {}\n", tree.lines[i]);
+    } else {
+        tree.text += "\n"; // the tree always ends with a blank line
     }
     Ok((tree, win))
 }
@@ -523,7 +525,10 @@ fn instructions(app: &apps::App) -> String {
 /// None and get the shorter one.
 fn state(snaps: &mut HashMap<i32, Snapshot>, app: &apps::App, notes: Option<String>) -> Result<Value, String> {
     let (tree, win) = render(app)?;
-    let title = ax::attr_str(win.0, "AXTitle").unwrap_or_else(|| "Unknown".into());
+    let frame = ax::frame(win.0).ok_or(server_err("window has no frame"))?;
+    let window_id = window_id(app.pid, frame).unwrap_or(0);
+    // The window server's title first (Chrome's omits the app name), then the AX title.
+    let title = window_name(window_id).or_else(|| ax::attr_str(win.0, "AXTitle")).unwrap_or_default();
     let window = format!("Window: \"{title}\", App: {}.\n{}", app.name, tree.text);
     let body = if let Some(notes) = notes {
         format!(
@@ -534,9 +539,7 @@ fn state(snaps: &mut HashMap<i32, Snapshot>, app: &apps::App, notes: Option<Stri
         format!("App={} (pid {})\n{window}", app.bundle_id, app.pid)
     };
     let mut content = vec![json!({"type": "text", "text": body})];
-    let frame = ax::frame(win.0).ok_or(server_err("window has no frame"))?;
     let mut image = (frame.2, frame.3);
-    let window_id = window_id(app.pid, frame).unwrap_or(0);
     let menu_open = ax::open_menu(ax::app_element(app.pid).0).is_some(); // no screenshot then
     match screenshot(window_id) {
         Ok(_) if menu_open => {}
@@ -572,6 +575,17 @@ pub fn windows(pid: i32, on_screen: bool) -> Vec<(u32, (f64, f64, f64, f64))> {
             (num(d, "kCGWindowNumber") as u32, bounds)
         })
         .collect()
+}
+
+/// The window server's name for a window (kCGWindowName), if it has one.
+fn window_name(id: u32) -> Option<String> {
+    let list = Cf(unsafe { CGWindowListCopyWindowInfo(8, id) } as _); // kCGWindowListOptionIncludingWindow
+    if list.0.is_null() || unsafe { CFArrayGetCount(list.0 as _) } == 0 {
+        return None;
+    }
+    let d = unsafe { CFArrayGetValueAtIndex(list.0 as _, 0) };
+    let v = unsafe { CFDictionaryGetValue(d as _, ax::cfstr("kCGWindowName").0) };
+    (!v.is_null()).then(|| ax::to_string(v)).flatten()
 }
 
 /// CGWindowID of the app's window closest to the AX window frame. All windows count, so

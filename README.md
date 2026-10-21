@@ -10,129 +10,116 @@ curl -fLO "$base/rust-computer-use-aarch64-apple-darwin.tar.gz"
 curl -fLO "$base/rust-computer-use-aarch64-apple-darwin.tar.gz.sha256"
 shasum -a 256 -c rust-computer-use-aarch64-apple-darwin.tar.gz.sha256
 tar -xzf rust-computer-use-aarch64-apple-darwin.tar.gz
-xattr -c rust-computer-use-aarch64-apple-darwin/rust-computer-use
-claude mcp add rust-computer-use -- "$PWD/rust-computer-use-aarch64-apple-darwin/rust-computer-use"
+xattr -cr "Rust Computer Use.app"
+mv "Rust Computer Use.app" /Applications/
+claude mcp add rust-computer-use -- "/Applications/Rust Computer Use.app/Contents/MacOS/rust-computer-use"
 ```
 
-The binary is ad-hoc signed, not notarized. A browser download gets a quarantine flag
-that stops it from running. The `xattr` line clears it, and does nothing if the flag
-isn't there. Claude Code reserves the name `computer-use`, so register it under another name.
-Releases are listed on the
-[releases page](https://github.com/yspreen/rust-computer-use/releases).
+The app is signed but not notarized. A browser download gets a quarantine flag
+that stops it from running, and the `xattr` line clears it. Claude Code reserves
+the name `computer-use`, so register it under another name. Releases are listed
+on the [releases page](https://github.com/yspreen/rust-computer-use/releases).
 
 To build from source instead:
 
 ```sh
-cargo build --release
-claude mcp add rust-computer-use -- "$PWD/target/release/rust-computer-use"
+scripts/bundle.sh   # set CODESIGN_IDENTITY to sign with your own certificate
+claude mcp add rust-computer-use -- "$PWD/target/release/Rust Computer Use.app/Contents/MacOS/rust-computer-use"
 ```
 
 ## What it is
 
-Clean-room Rust MCP stdio server with the same tool interface as OpenAI's Codex
-Computer Use (`list_apps`, `get_app_state`, `click`, `drag`,
-`perform_secondary_action`, `press_key`, `scroll`, `select_text`, `set_value`,
-`type_text`). The target app is never activated. Input goes to its process and
-window, so your frontmost app, cursor and keyboard focus stay put.
+A clean-room Rust MCP server with the same tool interface and output as OpenAI's
+Codex Computer Use (`list_apps`, `get_app_state`, `click`,
+`perform_secondary_action`, `set_value`, `select_text`, `scroll`, `drag`,
+`press_key`, `type_text`). The target app is never activated. Input goes to its
+process and window, so your frontmost app, your cursor and your keyboard focus
+stay where they are. Most of the behavior below was read out of the original's
+binary with Ghidra and checked against event taps on the apps it drives.
 
-It needs Accessibility and Screen Recording. macOS grants both to the app that
-launches it (your terminal, editor or agent app), not to this binary. On the first
-call without them, a setup window opens and lists both permissions. Allow opens the
-right System Settings pane, and a tile with the host app's icon docks under that
-window. Drag the tile into the list and switch it on. Run
-`rust-computer-use --setup` to open the window yourself. It sends no Apple Events,
-so you won't get per-app Automation prompts.
+## Permissions
+
+It needs Accessibility and Screen Recording, and asks for them under its own
+name. The binary your MCP client starts only relays to the app, which macOS
+starts the way it starts any app. Permissions then belong to "Rust Computer
+Use", not to your terminal or agent app. The original works the same way.
+
+On the first call without them, a window opens with a card per permission.
+Allow opens the right System Settings pane and docks a small panel in its
+corner with a tile of the app. Drag the tile into the list and switch it on. You
+won't see a system prompt, and the app sends no Apple Events, so no "wants to
+control" Automation prompts either. Open the app from Finder, or run the binary
+with `--setup`, to bring the window up yourself.
+
+Grants are tied to the code signature. Builds signed ad hoc get a new one each
+time, so sign with a stable certificate (`CODESIGN_IDENTITY`) if you rebuild often.
+
+## The cursor
+
+While the agent works, a cursor shows where it acts. It is the original's
+shape, and it moves the way the original's does. Long moves follow the best of 20
+candidate curves, timed by a spring, and short hops stretch and tilt. The click
+goes out once the cursor is close enough, and the cursor dips when it presses.
+It sits just above the app it works in, so windows covering that app cover the
+cursor too. When the app's window isn't on screen (another Space, or a hidden
+AeroSpace workspace) it skips the animation. It fades away after a few idle
+seconds. Your real pointer never moves.
 
 ## Safety
 
 - **Approval per app.** The first `get_app_state` for an app asks you through MCP
-  elicitation ("Allow Rust Computer Use to use Calculator?"). Approvals are saved in
-  `~/Library/Application Support/rust-computer-use/approvals.json`. Delete an entry to be
-  asked again. Clients without elicitation are refused unless
-  `RUST_COMPUTER_USE_APPROVE_ALL=1` is set.
-- **Blocked apps.** Terminals (Terminal, iTerm2, Ghostty, kitty, WezTerm, Warp,
-  Rio, Wave) and OpenAI's own apps are refused, the same list the original uses.
-- **Esc stops the agent.** While the agent is working, a pointer shows where it
-  acts. Pressing Esc makes every further call return the original's "stopped by
+  elicitation ("Allow Rust Computer Use to use Calculator?"). The answer lasts
+  for the session. It is saved to
+  `~/Library/Application Support/rust-computer-use/approvals.json` only when the
+  client asks for that (`_meta.persist: "always"`). Clients without elicitation are
+  refused unless `RUST_COMPUTER_USE_APPROVE_ALL=1` is set.
+- **Any app.** Unlike the original, nothing is blocked. Terminals, password
+  managers and browsers are all fair game, so approve with care.
+- **Esc stops the agent.** Every further call returns the original's "stopped by
   the user" message, until the agent has been idle for 30 seconds.
 - **Locked screen.** Nothing is read while the Mac is locked.
 
 ## How it works
 
-- **Tree:** AXUIElement walk of the key window plus the menu bar, in the original
-  text format. That covers flags such as `(selected, settable, boolean)`, fields such as
-  `Description`, `URL`, `Value`, `Placeholder` and `Secondary Actions`, and a closing
-  line naming the focused element. Bare one-child containers collapse, and empty
-  ones are dropped.
-- **Text values:** styled text renders as Markdown (`**bold**`, `*italic*`,
-  `<u>`, `~~`, `[link](url)`), built from `AXAttributedStringForRange`.
-  `select_text` matches that Markdown and maps the match back to plain offsets.
-- **Chromium/Electron:** `AXManualAccessibility` (Electron) and
-  `AXEnhancedUserInterface` (Chrome) switch on the web tree. A nearly empty tree is
-  re-read twice, because Chromium builds it lazily.
-- **Tables:** only on-screen rows, noted as `(showing 0-58 of 100 items)`. A row
-  reads as its cells' text, and outline rows get `Collapse`/`Expand`. Runs of
-  plain adjacent labels merge into one `text` line. When rows are selected, a
-  `Selected:` section and a note to the agent close the tree.
-- **Menus, sheets, hidden and minimized windows:** while a menu is open, the
-  state is that menu, rooted at its menu bar item, with no screenshot. The
-  original does the same. Close it with the item's `Cancel` action. An open
-  sheet becomes the root, and an untitled window prints `Window: "Unknown"`.
-  Minimized windows are restored, and hidden apps stay hidden but still get a
-  screenshot, both without activating the app. When the focused field has
-  selected text, a `Selected text:` block ends the tree.
-- **Screenshot:** `screencapture -l<windowID>`, JPEG, at full resolution as the original sends it.
-- **Clicks:** `AXPress` when available. Otherwise `CGEventPostToPid`, addressed to
-  the window (see below).
-- **Keys:** characters map to keycodes through the current keyboard layout
-  (`UCKeyTranslate`). Only a US layout has been tested. Text goes in through `AXSelectedText`
-  when the app actually applies it. Otherwise it is sent as key events.
-- **Scroll:** `AXScroll*ByPage` for whole pages. Otherwise pixel-unit wheel
-  events, where a page is the element's height or width.
-- **Actions:** each action returns the resulting state and screenshot. An action
-  is refused if the app changed since the last `get_app_state`, as the original does.
-  Before an app's first `get_app_state`, actions get the original's "not active"
-  message. Errors use its wording and `Computer Use server error -10005:` prefix.
-- **Mouse timing:** mouse events are ~50 ms apart. SwiftUI ignores presses whose
-  down and up arrive within a few milliseconds.
-- **list_apps:** NSWorkspace running apps, plus the original's Spotlight query
-  (`kMDItemLastUsedDate_Ranking >= $time.today(-14)`, `kMDItemUseCount`). Like
-  the original, it uses UTC dates and skips apps with a boolean `LSUIElement`.
-  It also hides recent apps whose bundle ID is a prefix of a running app's. The
-  output matched the original line for line on this Mac.
-- **Per-app instructions:** set `RUST_COMPUTER_USE_INSTRUCTIONS` to a directory of
-  `<App name>.md` or `<bundle id>.md` files. The original bundles its own,
-  and they are not copied here.
+- **Tree:** the original's transform pipeline over the key window plus the menu
+  bar. Single-child groups merge into their child, repeated hierarchy flattens,
+  fields that repeat an earlier value are dropped, and lines follow its field and
+  flag order. Tables print every row up to 500. On the seven apps compared
+  (TextEdit, Calculator, Safari, Chrome, Finder, System Settings, Preview), the
+  output matches the original's line for line.
+- **Window title:** the window server's name for the window, then the AX title.
+- **Chromium and Electron:** `AXManualAccessibility` when the app lists it, else
+  `AXEnhancedUserInterface`, written on every read because Chrome can drop its
+  web tree while still reporting the flag on. The flag is switched back off when
+  the session ends.
+- **Background apps:** before the first synthesized event, the app gets the
+  AppKit "application activated" event for its window and a press at the
+  window's activation point. That's the original's trick. Without it, shortcuts
+  such as `super+s` do nothing in a background app.
+- **Clicks:** `AXPress` for plain left clicks on elements, else mouse events at
+  the element's activation point. Mouse events carry the window number, event
+  numbers, pressure and subtype the original sets.
+- **Keys and text:** modifiers are sent as flagsChanged events around the key.
+  `type_text` sends key events from the current layout across eight
+  shift/option/control combinations. Characters no key produces are sent as
+  unicode events rather than dropped.
+- **Scroll:** one continuous pixel event of pages times the element's height or
+  width.
+- **After an action:** the state is read once the app's AX notifications have
+  been quiet for 0.25 s, at most 5 s.
+- **Screenshot:** `screencapture -l<windowID>`, JPEG, at full resolution. It works
+  for windows on other Spaces too.
+- **App instructions:** the original's browser note for any app that handles
+  http links. Per-app notes come from the Codex Computer Use app's bundled
+  AppInstructions if it is installed, or from `RUST_COMPUTER_USE_INSTRUCTIONS`.
+  Each is sent once per session.
 - **`app`** also accepts a pid, which picks one instance when several share a
   bundle ID.
 
-## Findings from the original (26.1013.1001501)
-
-- The service resolves every CGEvent and SkyLight function through `dlsym`, and
-  the names never appear in the binary. SIP blocks attaching at runtime.
-- `CGEventTapCreateForPid` on the target app captures what the service sends.
-  Mouse events carry the window number in fields 51, 91 and 92, plus a
-  window-local location (`CGEventSetWindowLocation`). AppKit drops background
-  clicks without them. Keyboard events need nothing special.
-
-## Verified in the background
-
-Calculator (SwiftUI), TextEdit (AppKit), Disk Utility (outline), Chrome web
-content, and Claude desktop (Electron). Each was tested with the target app
-behind another app, and the frontmost app was checked before and after. The
-trees for Calculator, TextEdit and Disk Utility match the original's output line
-for line. Esc-to-stop has not been tested with a real key press.
-
 ## Known differences
 
-- The original's built-in browser guidance and bundled per-app instructions
-  are not reproduced. Supply your own through `RUST_COMPUTER_USE_INSTRUCTIONS`.
-- The `Window:` line uses the AX title untruncated. The original shortens
-  long titles.
-- An app can refuse an action while in the background. Calculator rejects
-  `AXRaise` with AXError -25205.
-- The original draws its target window as active (key) without activating the app.
-  Rust Computer Use leaves the window's appearance alone.
-- Not reproduced: the original's URL blocklist (fetched from OpenAI), the
-  lock-screen auto-unlock helper, and its other non-tool features (appshots,
-  recording, Messages).
+- The original's fog cursor blurs whatever is behind it. This one draws a soft
+  shadow instead.
+- Not reproduced: the URL blocklist (fetched from OpenAI), the lock-screen
+  unlock helper, and the original's non-tool features (appshots, recording,
+  Messages).

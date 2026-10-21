@@ -136,6 +136,7 @@ fn serve() {
         reply(json!({"jsonrpc": "2.0", "id": id, "result": result}));
     }
     ax::restore_web();
+    input::disbelieve_all();
 }
 
 fn reply(v: Value) {
@@ -292,7 +293,7 @@ fn call(srv: &mut Server, name: &str, a: &Value) -> Result<Value, String> {
     }
     input::target(app.pid, snap.window_id, Pt { x: snap.window.0, y: snap.window.1 });
     if apps::frontmost() != Some(app.pid) {
-        input::notify_active(app.pid, true);
+        input::believe_active(app.pid);
     }
     act(snap, name, a, &app)?;
     // Actions answer with the resulting state, as the original does.

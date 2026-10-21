@@ -46,15 +46,37 @@ extern "C" {
     ) -> i32;
 }
 
-/// Tell a background app it is (or is no longer) the active app without activating it, as the
-/// original's focus enforcer does: an AppKit-defined ApplicationActivated (1) or Deactivated (2)
-/// event posted to the process. AppKit only honors key equivalents and modifier navigation
-/// (super+s, shift+alt+Left) in an app that believes it is active.
-pub fn notify_active(pid: i32, active: bool) {
+/// Apps told they are active, so they can be told otherwise when the agent moves on.
+static BELIEVERS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+
+/// Make a background app believe it is the active app without activating it, as the
+/// original's focus enforcer does: an AppKit-defined ApplicationActivated event posted to the
+/// process. AppKit only honors key equivalents and modifier navigation (super+s,
+/// shift+alt+Left) in an app that believes it is active. Any other app told so earlier gets
+/// ApplicationDeactivated first.
+pub fn believe_active(pid: i32) {
+    let mut b = BELIEVERS.lock().unwrap();
+    if b.contains(&pid) {
+        return;
+    }
+    for other in b.drain(..) {
+        post_app_event(other, 2);
+    }
+    post_app_event(pid, 1);
+    b.push(pid);
+}
+
+/// Undo believe_active for every app (at the end of the session).
+pub fn disbelieve_all() {
+    for pid in BELIEVERS.lock().unwrap().drain(..) {
+        post_app_event(pid, 2);
+    }
+}
+
+fn post_app_event(pid: i32, subtype: i16) {
     use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType};
     let ev = NSEvent::otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2(
-        NSEventType::AppKitDefined, objc2_foundation::NSPoint::ZERO, NSEventModifierFlags(0), 0.0, 0, None,
-        if active { 1 } else { 2 }, 0, 0,
+        NSEventType::AppKitDefined, objc2_foundation::NSPoint::ZERO, NSEventModifierFlags(0), 0.0, 0, None, subtype, 0, 0,
     );
     if let Some(ev) = ev {
         let cg: *const c_void = unsafe { objc2::msg_send![&*ev, CGEvent] };

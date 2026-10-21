@@ -135,6 +135,7 @@ fn serve() {
         };
         reply(json!({"jsonrpc": "2.0", "id": id, "result": result}));
     }
+    ax::restore_web();
 }
 
 fn reply(v: Value) {
@@ -445,13 +446,14 @@ fn render(app: &apps::App) -> Result<(ax::Tree, Cf), String> {
         return Ok((tree, win));
     }
     ax::render(win.0, 0, usize::MAX, &mut tree);
-    // Chromium builds its tree lazily (first request, or after going to the background):
-    // a nearly empty window is usually still filling in.
-    for _ in 0..2 {
-        if tree.elems.len() >= 8 {
+    // Chromium builds its web tree lazily (first request, or after dropping it in the
+    // background): give it up to 3 s to show page content, and a nearly empty window too.
+    let web = apps::chromium(&app.path) && ax::enable_web(app.pid);
+    for _ in 0..12 {
+        if (!web || tree.web_areas > 0) && tree.elems.len() >= 8 {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        std::thread::sleep(std::time::Duration::from_millis(250));
         tree = ax::Tree::default();
         ax::render(win.0, 0, usize::MAX, &mut tree);
     }

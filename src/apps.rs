@@ -46,6 +46,13 @@ pub fn handles_http(path: &str) -> bool {
     })
 }
 
+/// Chromium and Electron apps ship a "<Name> Framework" with Chromium's resource packs.
+pub fn chromium(path: &str) -> bool {
+    std::fs::read_dir(format!("{path}/Contents/Frameworks")).into_iter().flatten().flatten().any(|f| {
+        f.path().join("Resources/chrome_100_percent.pak").exists()
+    })
+}
+
 pub fn frontmost() -> Option<i32> {
     NSWorkspace::sharedWorkspace().frontmostApplication().map(|a| a.processIdentifier())
 }

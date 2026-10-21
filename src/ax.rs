@@ -27,6 +27,7 @@ extern "C" {
     fn AXUIElementCreateApplication(pid: i32) -> AXRef;
     fn AXUIElementCopyAttributeValue(e: AXRef, a: CFStringRef, v: *mut CFTypeRef) -> i32;
     fn AXUIElementSetAttributeValue(e: AXRef, a: CFStringRef, v: CFTypeRef) -> i32;
+    fn AXUIElementCopyAttributeNames(e: AXRef, v: *mut CFArrayRef) -> i32;
     fn AXUIElementCopyActionNames(e: AXRef, v: *mut CFArrayRef) -> i32;
     fn AXUIElementCopyActionDescription(e: AXRef, a: CFStringRef, v: *mut CFStringRef) -> i32;
     fn AXUIElementIsAttributeSettable(e: AXRef, a: CFStringRef, out: *mut bool) -> i32;
@@ -102,16 +103,42 @@ pub fn to_string(v: CFTypeRef) -> Option<String> {
 }
 
 pub fn app_element(pid: i32) -> Cf {
-    let app = Cf(unsafe { AXUIElementCreateApplication(pid) });
-    // Chromium/Electron only build their web trees when asked: Electron reads
-    // AXManualAccessibility, Chrome AXEnhancedUserInterface.
-    let t = Cf(unsafe { CFRetain(kCFBooleanTrue as _) });
-    for flag in ["AXManualAccessibility", "AXEnhancedUserInterface"] {
-        if attr_str(app.0, flag).as_deref() != Some("on") {
-            let _ = set_attr(app.0, flag, t.0);
-        }
+    Cf(unsafe { AXUIElementCreateApplication(pid) })
+}
+
+/// Apps whose web accessibility this process switched on, and the attribute it used.
+static ENABLED: std::sync::Mutex<Vec<(i32, &'static str)>> = std::sync::Mutex::new(Vec::new());
+
+/// Chromium/Electron only build their web trees when asked. Like the original, use
+/// AXManualAccessibility when the app lists it (Electron), else AXEnhancedUserInterface
+/// (Chrome). The flag is set on every read: Chrome can drop its web tree while still reporting
+/// the flag on, and only a fresh write brings it back. True for apps that take either flag.
+pub fn enable_web(pid: i32) -> bool {
+    let app = app_element(pid);
+    let mut names: CFArrayRef = std::ptr::null();
+    if unsafe { AXUIElementCopyAttributeNames(app.0, &mut names) } != 0 || names.is_null() {
+        return false;
     }
-    app
+    let names = Cf(names as _);
+    let listed: Vec<String> = array(&names).into_iter().filter_map(to_string).collect();
+    let Some(flag) = ["AXManualAccessibility", "AXEnhancedUserInterface"].into_iter().find(|f| listed.iter().any(|n| n == f)) else {
+        return false;
+    };
+    let was_on = attr_str(app.0, flag).as_deref() == Some("on");
+    let _ = set_bool(app.0, flag, true); // Chrome applies it but may still report an error
+    let mut enabled = ENABLED.lock().unwrap();
+    if !was_on && !enabled.contains(&(pid, flag)) {
+        enabled.push((pid, flag));
+    }
+    true
+}
+
+/// Switch off what enable_web switched on (the original drops its enablement assertion when
+/// the session ends): AXEnhancedUserInterface slows window animations and window managers.
+pub fn restore_web() {
+    for (pid, flag) in ENABLED.lock().unwrap().drain(..) {
+        let _ = set_bool(app_element(pid).0, flag, false);
+    }
 }
 
 pub fn attr(e: AXRef, name: &str) -> Option<Cf> {
@@ -296,6 +323,8 @@ pub fn open_menu(app: AXRef) -> Option<Cf> {
 /// A rendered tree: the text, and per index the element and its line.
 #[derive(Default)]
 pub struct Tree {
+    /// Web areas (AXWebArea) that have content, to tell when a browser has built its tree.
+    pub web_areas: usize,
     pub text: String,
     pub elems: Vec<Cf>,
     pub lines: Vec<String>,
@@ -491,6 +520,9 @@ pub fn render(root: AXRef, depth: usize, max_depth: usize, tree: &mut Tree) {
     tree.text += &format!("{}{line}\n", "\t".repeat(depth));
     tree.lines.push(line);
     tree.elems.push(Cf(unsafe { CFRetain(root) }));
+    if role == "AXWebArea" && !children.is_empty() {
+        tree.web_areas += 1;
+    }
     if depth < max_depth {
         // Look through bare one-child wrappers first, as the collapse rule below would.
         let held: Vec<Cf> = children.iter().map(|&c| unwrap_group(c)).collect();

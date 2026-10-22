@@ -53,6 +53,8 @@ struct Seen {
 pub struct Tap {
     port: usize,
     run_loop: usize,
+    stopped: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 /// What a tap's trampoline needs: the real callback, its context, and the tap to re-enable.
@@ -74,38 +76,50 @@ extern "C" fn trampoline(proxy: *const c_void, ty: u32, e: Ev, hook: *mut c_void
 }
 
 impl Tap {
-    pub fn start(pid: Option<i32>, place: u32, types: &[u32], cb: TapCallback, ctx: *mut c_void) -> Option<Tap> {
+    pub fn start<T: Send + Sync + 'static>(pid: Option<i32>, place: u32, types: &[u32], cb: TapCallback, ctx: Arc<T>) -> Option<Tap> {
         let mask = types.iter().fold(0u64, |m, t| m | 1 << t);
-        let hook = Box::into_raw(Box::new(Hook { cb, ctx: ctx as usize, port: Default::default() })) as usize;
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = stopped.clone();
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || unsafe {
+        let thread = std::thread::spawn(move || unsafe {
+            let hook = Box::new(Hook { cb, ctx: Arc::as_ptr(&ctx) as usize, port: Default::default() });
+            let hook_ptr = &*hook as *const Hook as *mut c_void;
             let port = match pid {
-                Some(pid) => CGEventTapCreateForPid(pid, place, 0, mask, trampoline, hook as _),
-                None => CGEventTapCreate(2, place, 0, mask, trampoline, hook as _), // kCGAnnotatedSessionEventTap
+                Some(pid) => CGEventTapCreateForPid(pid, place, 0, mask, trampoline, hook_ptr),
+                None => CGEventTapCreate(2, place, 0, mask, trampoline, hook_ptr), // kCGAnnotatedSessionEventTap
             };
             if port.is_null() {
-                return tx.send(None).unwrap();
+                let _ = tx.send(None);
+                return;
             }
-            (*(hook as *const Hook)).port.store(port as usize, std::sync::atomic::Ordering::Relaxed);
+            hook.port.store(port as usize, std::sync::atomic::Ordering::Relaxed);
             let src = Cf(CFMachPortCreateRunLoopSource(std::ptr::null(), port, 0));
             let rl = CFRunLoopGetCurrent();
             CFRunLoopAddSource(rl, src.0, kCFRunLoopCommonModes);
             CGEventTapEnable(port, true);
-            tx.send(Some(Tap { port: port as usize, run_loop: CFRetain(rl) as usize })).unwrap();
-            CFRunLoopRun();
+            let _ = tx.send(Some((port as usize, CFRetain(rl) as usize)));
+            while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                core_foundation_sys::runloop::CFRunLoopRunInMode(core_foundation_sys::runloop::kCFRunLoopDefaultMode, 0.1, false as _);
+            }
+            CFMachPortInvalidate(port);
             drop(Cf(port));
-            drop(Box::from_raw(hook as *mut Hook));
+            drop(hook);
+            drop(ctx);
         });
-        rx.recv().ok().flatten()
+        match rx.recv().ok().flatten() {
+            Some((port, run_loop)) => Some(Tap { port, run_loop, stopped, thread: Some(thread) }),
+            None => { let _ = thread.join(); None }
+        }
     }
 }
 
 impl Drop for Tap {
     fn drop(&mut self) {
         unsafe {
+            self.stopped.store(true, std::sync::atomic::Ordering::Release);
             CGEventTapEnable(self.port as _, false);
-            CFMachPortInvalidate(self.port as _);
             CFRunLoopStop(self.run_loop as _);
+            if let Some(thread) = self.thread.take() { let _ = thread.join(); }
             drop(Cf(self.run_loop as _));
         }
     }
@@ -176,8 +190,8 @@ pub fn safely_enforce(target: i32, enforce: impl FnOnce()) -> Result<(), String>
     let seen = Arc::new(UserTap { seen: Mutex::new(Seen { any: false, activated: false, at: Instant::now() }) });
     let redirect = Arc::new(TargetTap { own: std::process::id() as i32, target, user });
     let taps = [
-        Tap::start(Some(user), 0, &[13, 20, 19], user_tap, Arc::as_ptr(&seen) as _),
-        Tap::start(Some(target), 0, &[10, 11, 12], target_tap, Arc::as_ptr(&redirect) as _),
+        Tap::start(Some(user), 0, &[13, 20, 19], user_tap, seen.clone()),
+        Tap::start(Some(target), 0, &[10, 11, 12], target_tap, redirect.clone()),
     ];
 
     let cid = spi(c"CGSMainConnectionID").map_or(0, |f| f(0));

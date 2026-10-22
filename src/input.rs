@@ -60,9 +60,6 @@ extern "C" {
     ) -> i32;
 }
 
-/// Apps told they are active, so they can be told otherwise when the agent moves on.
-static BELIEVERS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
-
 /// The original's enforceActiveState: make a background app believe it is the active app
 /// without activating it. An AppKit-defined ApplicationActivated event for the window, then a
 /// press at the window's activation point (AppKit only honors key equivalents and modifier
@@ -70,11 +67,6 @@ static BELIEVERS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
 /// an activation point only the bare event goes out. Any other app told so earlier gets
 /// ApplicationDeactivated first. Callers run it whenever the app no longer believes it has focus.
 pub fn believe_active(pid: i32, activation: Option<Pt>) {
-    let mut b = BELIEVERS.lock().unwrap();
-    for other in b.iter().filter(|p| **p != pid) {
-        post_app_event(*other, 2, 0);
-    }
-    b.clear();
     let window = WINDOW.load(Relaxed);
     match activation.filter(|_| window != 0) {
         Some(p) => {
@@ -85,17 +77,9 @@ pub fn believe_active(pid: i32, activation: Option<Pt>) {
         }
         None => post_app_event(pid, 1, 0),
     }
-    b.push(pid);
 }
 
-/// Undo believe_active for every app (at the end of the session).
-pub fn disbelieve_all() {
-    for pid in BELIEVERS.lock().unwrap().drain(..) {
-        post_app_event(pid, 2, 0);
-    }
-}
-
-fn post_app_event(pid: i32, subtype: i16, window: u32) {
+pub(crate) fn post_app_event(pid: i32, subtype: i16, window: u32) {
     use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType};
     let flags = NSEventModifierFlags(if window == 0 { 0 } else { 0xc0000 });
     let ev = NSEvent::otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2(

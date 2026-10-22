@@ -5,6 +5,7 @@ mod cursor;
 mod focus;
 mod input;
 mod overlay;
+mod preventer;
 mod service;
 mod setup;
 mod text;
@@ -59,6 +60,7 @@ impl Io {
 struct Server {
     io: Io,
     snaps: HashMap<i32, Snapshot>,
+    enforcers: HashMap<i32, focus::Enforcer>,
 }
 
 fn main() {
@@ -100,6 +102,7 @@ fn serve(input: Box<dyn BufRead + Send>, out: Box<dyn Write + Send>) {
     let mut srv = Server {
         io: Io { lines: input.lines(), out },
         snaps: HashMap::new(),
+        enforcers: HashMap::new(),
     };
     while let Some(msg) = srv.io.next() {
         let Some(id) = msg.get("id").cloned().filter(|_| msg.get("method").is_some()) else {
@@ -131,7 +134,7 @@ fn serve(input: Box<dyn BufRead + Send>, out: Box<dyn Write + Send>) {
         srv.io.send(json!({"jsonrpc": "2.0", "id": id, "result": result}));
     }
     ax::restore_web();
-    input::disbelieve_all();
+    srv.enforcers.clear();
 }
 
 /// Tool schemas, worded exactly as the original advertises them.
@@ -263,14 +266,17 @@ fn call(srv: &mut Server, name: &str, a: &Value) -> Result<Value, String> {
         }
     }
     input::target(app.pid, snap.window_id, Pt { x: snap.window.0, y: snap.window.1 });
-    act(snap, name, a, &app)?;
+    if !srv.enforcers.contains_key(&app.pid) {
+        srv.enforcers.insert(app.pid, focus::Enforcer::new(app.pid).map_err(server_err)?);
+    }
+    act(snap, name, a, &app, &srv.enforcers[&app.pid])?;
     // Actions answer with the resulting state once the UI settles, as the original does.
     settle(app.pid);
     state(&mut srv.snaps, &app, false)
         .or_else(|_| Ok(text("Action completed. Call `get_app_state` to fetch the updated UI state.")))
 }
 
-fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App) -> Result<(), String> {
+fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App, enforcer: &focus::Enforcer) -> Result<(), String> {
     let index = a["element_index"].as_str().unwrap_or("").trim().to_string();
     let elem = || -> Result<&Cf, String> {
         let i: usize = index.parse().map_err(|_| server_err(format!("{index} is an invalid element ID")))?;
@@ -287,14 +293,13 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App) -> Result<(), St
     // The original's focus enforcer: whenever the app no longer believes it has focus, it is
     // made to believe so with the user's app kept in front and the screen frozen.
     let enforce = || -> Result<(), String> {
-        if focus::believes_focus(app.pid) {
+        if enforcer.believes_focus() {
             return Ok(());
         }
         input::set_mouse_flags(0);
         let win = ax::window(ax::app_element(app.pid).0);
         let point = win.and_then(|w| input::ax_point(w.0, "AXActivationPoint"));
-        focus::safely_enforce(app.pid, || input::believe_active(app.pid, point)).map_err(server_err)?;
-        focus::set_believes_focus(app.pid);
+        enforcer.enforce(point).map_err(server_err)?;
         Ok(())
     };
     // Rule B of the original's sendClick: activate only for clicks inside web views or on text
@@ -302,7 +307,7 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App) -> Result<(), St
     let prepare_click = |el: Option<&Cf>, at: Pt| -> Result<(), String> {
         let hit = ax::element_at(app.pid, at.x, at.y);
         let web = el.or(hit.as_ref()).is_some_and(|e| ax::in_web_view(e.0));
-        if focus::believes_focus(app.pid) || apps::frontmost() == Some(app.pid) {
+        if enforcer.believes_focus() {
             input::set_mouse_flags(0);
         } else if web || hit.as_ref().is_some_and(|e| ax::may_select(e.0)) {
             enforce()?;

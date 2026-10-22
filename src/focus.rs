@@ -24,7 +24,6 @@ extern "C" {
     fn CFMachPortInvalidate(port: *const c_void);
     fn CFRunLoopGetCurrent() -> *const c_void;
     fn CFRunLoopAddSource(rl: *const c_void, src: *const c_void, mode: *const c_void);
-    fn CFRunLoopRun();
     fn CFRunLoopStop(rl: *const c_void);
     fn CFRetain(v: *const c_void) -> *const c_void;
     static kCFRunLoopCommonModes: *const c_void;
@@ -37,8 +36,12 @@ extern "C" {
 /// A WindowServer SPI function, resolved at run time as the original does (CoreGraphics
 /// re-exports SkyLight's SLS functions under their CGS names).
 fn spi(name: &std::ffi::CStr) -> Option<extern "C" fn(i32) -> i32> {
-    let f = unsafe { dlsym(-2isize as _, name.as_ptr()) }; // RTLD_DEFAULT
-    (!f.is_null()).then(|| unsafe { std::mem::transmute::<*mut c_void, extern "C" fn(i32) -> i32>(f) })
+    symbol(name).map(|f| unsafe { std::mem::transmute::<usize, extern "C" fn(i32) -> i32>(f) })
+}
+
+pub(crate) fn symbol(name: &std::ffi::CStr) -> Option<usize> {
+    let f = unsafe { dlsym(-2isize as _, name.as_ptr()) };
+    (!f.is_null()).then_some(f as usize)
 }
 
 /// What the tap on the user's app saw: any (de)activation, an activation, and when.
@@ -257,14 +260,98 @@ fn wait_frontmost(pid: i32, timeout: f64) {
     }
 }
 
-/// Whether the target believes it has focus, as the enforcer's state tracks it. Set by an
-/// enforcement; cleared when the user's front app changes since then.
-static BELIEVES: Mutex<Option<(i32, Option<i32>)>> = Mutex::new(None);
-
-pub fn believes_focus(pid: i32) -> bool {
-    *BELIEVES.lock().unwrap() == Some((pid, crate::apps::frontmost()))
+#[derive(Default)]
+pub struct State {
+    believes_active: bool,
+    pub believes_focus: bool,
+    active: bool,
 }
 
-pub fn set_believes_focus(pid: i32) {
-    *BELIEVES.lock().unwrap() = Some((pid, crate::apps::frontmost()));
+struct EnforcerContext {
+    pid: i32,
+    state: Arc<Mutex<State>>,
+}
+
+extern "C" fn activation(_: Ev, ty: u32, e: Ev, ctx: *mut c_void) -> Ev {
+    let ctx = unsafe { &*(ctx as *const EnforcerContext) };
+    let mut s = ctx.state.lock().unwrap();
+    let sub = unsafe { CGEventGetIntegerValueField(e, 83) };
+    match (ty, sub) {
+        (20, _) | (13, 1) => { s.believes_active = true; s.believes_focus = true; }
+        (19, _) | (13, 2) if s.believes_active && !s.active => return std::ptr::null(),
+        (13, 22 | 23) if s.believes_active && !s.active => return std::ptr::null(),
+        (19, _) | (13, 2) => { s.believes_active = false; s.believes_focus = false; }
+        _ => {}
+    }
+    e
+}
+
+extern "C" fn user_click(_: Ev, _: u32, e: Ev, ctx: *mut c_void) -> Ev {
+    let ctx = unsafe { &*(ctx as *const EnforcerContext) };
+    let s = ctx.state.lock().unwrap();
+    if !(s.believes_active && !s.active) { return e; }
+    drop(s);
+    let field = |f| unsafe { CGEventGetIntegerValueField(e, f) };
+    if field(41) != std::process::id() as i64 && field(40) != ctx.pid as i64
+        && crate::window_owner(field(51) as u32) == Some(ctx.pid) {
+        if let Some(app) = objc2_app_kit::NSRunningApplication::runningApplicationWithProcessIdentifier(ctx.pid) {
+            #[allow(deprecated)]
+            app.activateWithOptions(objc2_app_kit::NSApplicationActivationOptions(0));
+        }
+    }
+    e
+}
+
+pub struct Enforcer {
+    pid: i32,
+    state: Arc<Mutex<State>>,
+    taps: Vec<Tap>,
+    preventer: Arc<crate::preventer::Preventer>,
+    observer: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_foundation::NSObjectProtocol>>,
+}
+
+impl Enforcer {
+    pub fn new(pid: i32) -> Result<Self, String> {
+        let active = crate::apps::frontmost() == Some(pid);
+        let state = Arc::new(Mutex::new(State { believes_active: active, believes_focus: false, active }));
+        let preventer = crate::preventer::Preventer::register(pid, &state)?;
+        state.lock().unwrap().believes_focus = preventer.focused(pid);
+        let ctx = Arc::new(EnforcerContext { pid, state: state.clone() });
+        let taps = (|| Ok::<_, String>(vec![
+            Tap::start(Some(pid), 0, &[13, 19, 20], activation, ctx.clone()).ok_or("Could not observe app activation")?,
+            Tap::start(None, 0, &[1, 2, 3, 4, 6, 7, 25, 26, 27], user_click, ctx).ok_or("Could not protect background clicks")?,
+            preventer.keyboard_tap(pid).ok_or("Could not protect keyboard focus")?,
+        ]))();
+        let taps = match taps { Ok(t) => t, Err(e) => { preventer.unregister(&state); return Err(e); } };
+        let observed = state.clone();
+        let block = block2::RcBlock::new(move |_: std::ptr::NonNull<objc2_foundation::NSNotification>| {
+            observed.lock().unwrap().active = crate::apps::frontmost() == Some(pid);
+        });
+        let observer = unsafe { objc2_app_kit::NSWorkspace::sharedWorkspace().notificationCenter()
+            .addObserverForName_object_queue_usingBlock(Some(objc2_app_kit::NSWorkspaceDidActivateApplicationNotification), None, None, &block) };
+        Ok(Self { pid, state, taps, preventer, observer })
+    }
+
+    pub fn believes_focus(&self) -> bool { self.state.lock().unwrap().believes_focus }
+
+    pub fn enforce(&self, point: Option<crate::input::Pt>) -> Result<(), String> {
+        if self.believes_focus() { return Ok(()); }
+        safely_enforce(self.pid, || {
+            crate::input::believe_active(self.pid, point);
+            let mut s = self.state.lock().unwrap();
+            s.believes_active = true;
+            s.believes_focus = true;
+        })
+    }
+}
+
+impl Drop for Enforcer {
+    fn drop(&mut self) {
+        self.taps.clear();
+        let s = self.state.lock().unwrap();
+        if s.believes_active && !s.active { crate::input::post_app_event(self.pid, 2, 0); }
+        drop(s);
+        unsafe { objc2_app_kit::NSWorkspace::sharedWorkspace().notificationCenter().removeObserver((*self.observer).as_ref()) };
+        self.preventer.unregister(&self.state);
+    }
 }

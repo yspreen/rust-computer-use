@@ -6,6 +6,7 @@
 //! and the setup window hands System Settings this app's bundle.
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
@@ -113,6 +114,12 @@ pub fn relay(app: &PathBuf) -> Result<(), String> {
 pub fn listen(serve: fn(Box<dyn BufRead + Send>, Box<dyn Write + Send>)) {
     let path = socket();
     let _ = std::fs::create_dir_all(path.parent().unwrap());
+    // Concurrent relays may launch together. Only one service may replace the socket.
+    // Keep the lock open for this listener's lifetime; the kernel releases it on exit.
+    extern "C" { fn flock(fd: i32, operation: i32) -> i32; }
+    let lock = std::fs::OpenOptions::new().create(true).write(true).truncate(false)
+        .open(path.with_extension("lock")).expect("could not open service lock");
+    if unsafe { flock(lock.as_raw_fd(), 2 | 4) } != 0 { std::process::exit(0); } // LOCK_EX | LOCK_NB
     let _ = std::fs::remove_file(&path);
     let listener = match UnixListener::bind(&path) {
         Ok(l) => l,

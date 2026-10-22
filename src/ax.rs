@@ -25,6 +25,7 @@ const STANDARD_ACTIONS: &[(&str, &str)] = &[
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
     fn AXUIElementCreateApplication(pid: i32) -> AXRef;
+    fn AXUIElementGetPid(e: AXRef, pid: *mut i32) -> i32;
     fn AXUIElementCopyAttributeValue(e: AXRef, a: CFStringRef, v: *mut CFTypeRef) -> i32;
     fn AXUIElementSetAttributeValue(e: AXRef, a: CFStringRef, v: CFTypeRef) -> i32;
     fn AXObserverCreate(pid: i32, callback: ObserverCallback, out: *mut AXRef) -> i32;
@@ -211,6 +212,15 @@ pub fn restore_web() {
 }
 
 pub type ObserverCallback = extern "C" fn(AXRef, AXRef, CFStringRef, *mut c_void);
+
+pub fn pid(e: AXRef) -> Option<i32> {
+    let mut pid = 0;
+    (unsafe { AXUIElementGetPid(e, &mut pid) } == 0).then_some(pid)
+}
+
+pub fn observe_element(obs: AXRef, e: AXRef, name: &str, context: *mut c_void) {
+    unsafe { AXObserverAddNotification(obs, e, cfstr(name).0 as _, context) };
+}
 
 /// An AXObserver for some of an app's notifications, scheduled on this thread's run loop
 /// (run it with run_loop_for). Dropping it unschedules it.

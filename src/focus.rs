@@ -324,6 +324,7 @@ pub struct Enforcer {
     state: Arc<Mutex<State>>,
     taps: Vec<Tap>,
     preventer: Arc<crate::preventer::Preventer>,
+    menu: Option<crate::menu::Watcher>,
     observer: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_foundation::NSObjectProtocol>>,
 }
 
@@ -346,7 +347,7 @@ impl Enforcer {
         });
         let observer = unsafe { objc2_app_kit::NSWorkspace::sharedWorkspace().notificationCenter()
             .addObserverForName_object_queue_usingBlock(Some(objc2_app_kit::NSWorkspaceDidActivateApplicationNotification), None, None, &block) };
-        Ok(Self { pid, state, taps, preventer, observer })
+        Ok(Self { pid, state, taps, preventer, observer, menu: Some(crate::menu::Watcher::new(pid)) })
     }
 
     pub fn believes_focus(&self) -> bool { self.state.lock().unwrap().believes_focus }
@@ -368,6 +369,7 @@ impl Enforcer {
 
 impl Drop for Enforcer {
     fn drop(&mut self) {
+        self.menu.take();
         self.taps.clear();
         let s = self.state.lock().unwrap();
         if s.believes_active && !s.active { crate::input::post_app_event(self.pid, 2, 0); }

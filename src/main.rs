@@ -4,6 +4,7 @@ mod ax;
 mod cursor;
 mod focus;
 mod input;
+mod menu;
 mod overlay;
 mod preventer;
 mod service;

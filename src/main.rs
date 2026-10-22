@@ -2,6 +2,7 @@
 mod apps;
 mod ax;
 mod cursor;
+mod focus;
 mod input;
 mod overlay;
 mod service;
@@ -283,12 +284,32 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App) -> Result<(), St
         ax::frame(e.0).map(|(x, y, w, h)| Pt { x: x + w / 2.0, y: y + h / 2.0 }).ok_or(server_err("element has no frame"))
     };
     let f = |k: &str| a[k].as_f64().ok_or(format!("Missing required argument: {k}"));
-    // Before the first synthesized event, a background app is made to believe it is active.
-    let activate = || {
-        if apps::frontmost() != Some(app.pid) {
-            let win = ax::window(ax::app_element(app.pid).0);
-            input::believe_active(app.pid, win.and_then(|w| input::ax_point(w.0, "AXActivationPoint")));
+    // The original's focus enforcer: whenever the app no longer believes it has focus, it is
+    // made to believe so with the user's app kept in front and the screen frozen.
+    let enforce = || -> Result<(), String> {
+        if focus::believes_focus(app.pid) {
+            return Ok(());
         }
+        input::set_mouse_flags(0);
+        let win = ax::window(ax::app_element(app.pid).0);
+        let point = win.and_then(|w| input::ax_point(w.0, "AXActivationPoint"));
+        focus::safely_enforce(app.pid, || input::believe_active(app.pid, point)).map_err(server_err)?;
+        focus::set_believes_focus(app.pid);
+        Ok(())
+    };
+    // Rule B of the original's sendClick: activate only for clicks inside web views or on text
+    // that may get selected; other clicks carry Command so AppKit leaves the app in the back.
+    let prepare_click = |el: Option<&Cf>, at: Pt| -> Result<(), String> {
+        let hit = ax::element_at(app.pid, at.x, at.y);
+        let web = el.or(hit.as_ref()).is_some_and(|e| ax::in_web_view(e.0));
+        if focus::believes_focus(app.pid) || apps::frontmost() == Some(app.pid) {
+            input::set_mouse_flags(0);
+        } else if web || hit.as_ref().is_some_and(|e| ax::may_select(e.0)) {
+            enforce()?;
+        } else {
+            input::set_mouse_flags(0x100000);
+        }
+        Ok(())
     };
 
     match name {
@@ -310,7 +331,7 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App) -> Result<(), St
                     cursor::press(1);
                     return Ok(());
                 }
-                activate();
+                prepare_click(Some(e), at)?;
                 click_with_cursor(at, button, count, false);
             } else {
                 let at = to_screen(f("x")?, f("y")?);
@@ -319,14 +340,14 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App) -> Result<(), St
                     return Err(server_err(format!("windowNotFoundAtPosition(({:?}, {:?}))", at.x, at.y)));
                 }
                 cursor::move_to(at, w);
-                activate();
+                prepare_click(None, at)?;
                 click_with_cursor(at, button, count, true);
             }
         }
         "drag" => {
             let (from, to) = (to_screen(f("from_x")?, f("from_y")?), to_screen(f("to_x")?, f("to_y")?));
             cursor::move_to(from, snap.window_id);
-            activate();
+            prepare_click(None, from)?;
             input::drag(from, to);
             cursor::move_to(to, snap.window_id);
         }
@@ -342,11 +363,11 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App) -> Result<(), St
             ax::perform(e.0, &action.0).map_err(server_err)?;
         }
         "press_key" => {
-            activate();
+            enforce()?;
             input::press(a["key"].as_str().unwrap_or("")).map_err(|k| server_err(format!("keyNotFound(\"{k}\")")))?
         }
         "type_text" => {
-            activate();
+            enforce()?;
             input::type_text(a["text"].as_str().unwrap_or(""));
         }
         "set_value" => {
@@ -374,7 +395,7 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App) -> Result<(), St
                 _ => (0, px(w)),
             };
             cursor::move_to(center(e)?, snap.window_id);
-            activate();
+            input::set_mouse_flags(0);
             input::scroll(center(e)?, dy, dx);
         }
         "select_text" => {
@@ -527,6 +548,23 @@ fn state(snaps: &mut HashMap<i32, Snapshot>, app: &apps::App, full: bool) -> Res
     }
     snaps.insert(app.pid, Snapshot { taken: std::time::Instant::now(), tree, window: frame, window_id, image });
     Ok(Value::Array(content))
+}
+
+/// On-screen windows front to back, desktop excluded, as (number, owner pid, layer).
+pub fn window_list() -> Vec<(u32, i32, i64)> {
+    let list = Cf(unsafe { CGWindowListCopyWindowInfo(1 | 16, 0) } as _);
+    let num = |d: *const std::ffi::c_void, k: &str| {
+        let v = unsafe { CFDictionaryGetValue(d as _, ax::cfstr(k).0) };
+        let mut n = 0i64;
+        if !v.is_null() {
+            unsafe { CFNumberGetValue(v as _, core_foundation_sys::number::kCFNumberSInt64Type, &mut n as *mut i64 as _) };
+        }
+        n
+    };
+    (0..unsafe { CFArrayGetCount(list.0 as _) })
+        .map(|i| unsafe { CFArrayGetValueAtIndex(list.0 as _, i) })
+        .map(|d| (num(d, "kCGWindowNumber") as u32, num(d, "kCGWindowOwnerPID") as i32, num(d, "kCGWindowLayer")))
+        .collect()
 }
 
 /// The app's normal (layer 0) windows as (window number, CG bounds x, y, w, h).

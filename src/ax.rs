@@ -39,6 +39,43 @@ extern "C" {
     fn AXUIElementPerformAction(e: AXRef, a: CFStringRef) -> i32;
     fn AXValueGetValue(v: CFTypeRef, t: u32, out: *mut c_void) -> bool;
     fn AXValueCreate(t: u32, v: *const c_void) -> CFTypeRef;
+    fn _AXUIElementGetWindow(e: AXRef, id: *mut u32) -> i32;
+    fn AXUIElementCopyElementAtPosition(app: AXRef, x: f32, y: f32, out: *mut AXRef) -> i32;
+}
+
+/// The app's element at a screen point.
+pub fn element_at(pid: i32, x: f64, y: f64) -> Option<Cf> {
+    let mut e = std::ptr::null();
+    let app = app_element(pid);
+    (unsafe { AXUIElementCopyElementAtPosition(app.0, x as f32, y as f32, &mut e) } == 0 && !e.is_null()).then(|| Cf(e))
+}
+
+/// Whether the element sits inside a web area.
+pub fn in_web_view(e: AXRef) -> bool {
+    let mut cur = attr(e, "AXParent");
+    while let Some(c) = cur {
+        if attr_str(c.0, "AXRole").as_deref() == Some("AXWebArea") {
+            return true;
+        }
+        cur = attr(c.0, "AXParent");
+    }
+    false
+}
+
+/// Whether clicking the element may select text (text views and static text), so the app has
+/// to believe it is active first.
+pub fn may_select(e: AXRef) -> bool {
+    matches!(attr_str(e, "AXRole").as_deref(), Some("AXTextField" | "AXTextArea" | "AXStaticText" | "AXComboBox"))
+}
+
+/// The window server number of a window element.
+pub fn window_id(e: AXRef) -> Option<u32> {
+    let mut id = 0;
+    (unsafe { _AXUIElementGetWindow(e, &mut id) } == 0).then_some(id)
+}
+
+pub fn to_bool(v: CFTypeRef) -> bool {
+    unsafe { CFGetTypeID(v) == CFBooleanGetTypeID() && CFBooleanGetValue(v as _) }
 }
 
 /// Owned CF object, released on drop.

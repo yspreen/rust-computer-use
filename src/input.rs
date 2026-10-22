@@ -2,7 +2,7 @@
 use crate::ax::Cf;
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicI32, AtomicI64, AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::{AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::{Mutex, OnceLock};
 use std::{thread::sleep, time::Duration};
 
@@ -11,6 +11,13 @@ use std::{thread::sleep, time::Duration};
 static PID: AtomicI32 = AtomicI32::new(0);
 static WINDOW: AtomicU32 = AtomicU32::new(0);
 static ORIGIN: Mutex<Pt> = Mutex::new(Pt { x: 0.0, y: 0.0 });
+/// Flags added to every mouse event: Command for a click on an app that doesn't believe it
+/// has focus, which AppKit delivers without activating the app (the original's sendClick).
+static MOUSE_FLAGS: AtomicU64 = AtomicU64::new(0);
+
+pub fn set_mouse_flags(flags: u64) {
+    MOUSE_FLAGS.store(flags, Relaxed);
+}
 
 type Ev = *const c_void;
 #[repr(C)]
@@ -56,20 +63,18 @@ extern "C" {
 /// Apps told they are active, so they can be told otherwise when the agent moves on.
 static BELIEVERS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
 
-/// Make a background app believe it is the active app without activating it, as the
-/// original's focus enforcer does before its first synthesized event: an AppKit-defined
-/// ApplicationActivated event for the window, then a press at the window's activation point
-/// (AppKit only honors key equivalents and modifier navigation such as super+s or
-/// shift+alt+Left in an app that believes it is active). Without an activation point only
-/// the bare event goes out. Any other app told so earlier gets ApplicationDeactivated first.
+/// The original's enforceActiveState: make a background app believe it is the active app
+/// without activating it. An AppKit-defined ApplicationActivated event for the window, then a
+/// press at the window's activation point (AppKit only honors key equivalents and modifier
+/// navigation such as super+s or shift+alt+Left in an app that believes it is active). Without
+/// an activation point only the bare event goes out. Any other app told so earlier gets
+/// ApplicationDeactivated first. Callers run it whenever the app no longer believes it has focus.
 pub fn believe_active(pid: i32, activation: Option<Pt>) {
     let mut b = BELIEVERS.lock().unwrap();
-    if b.contains(&pid) {
-        return;
+    for other in b.iter().filter(|p| **p != pid) {
+        post_app_event(*other, 2, 0);
     }
-    for other in b.drain(..) {
-        post_app_event(other, 2, 0);
-    }
+    b.clear();
     let window = WINDOW.load(Relaxed);
     match activation.filter(|_| window != 0) {
         Some(p) => {
@@ -80,9 +85,6 @@ pub fn believe_active(pid: i32, activation: Option<Pt>) {
         }
         None => post_app_event(pid, 1, 0),
     }
-    // Give AppKit a moment to take the activation before input arrives (the original's
-    // first key follows about 8 ms later).
-    pause(10);
     b.push(pid);
 }
 
@@ -150,7 +152,7 @@ fn address(e: Ev, p: Pt) -> Ev {
 }
 
 /// A mouse event the way the original builds them: event number (field 0), click state (1),
-/// pressure 1.0 (2), button number (3), mouse subtype 3 (7) and no modifiers, so a key the
+/// pressure 1.0 (2), button number (3), mouse subtype 3 (7) and only MOUSE_FLAGS, so a key the
 /// user holds can't turn a click into a control-click.
 fn mouse(ty: u32, p: Pt, button: u32, number: i64, clicks: i64) -> Ev {
     let e = address(unsafe { CGEventCreateMouseEvent(std::ptr::null(), ty, p, button) }, p);
@@ -160,7 +162,7 @@ fn mouse(ty: u32, p: Pt, button: u32, number: i64, clicks: i64) -> Ev {
         CGEventSetDoubleValueField(e, 2, 1.0);
         CGEventSetIntegerValueField(e, 3, button as i64);
         CGEventSetIntegerValueField(e, 7, 3);
-        CGEventSetFlags(e, 0);
+        CGEventSetFlags(e, MOUSE_FLAGS.load(Relaxed));
     }
     e
 }

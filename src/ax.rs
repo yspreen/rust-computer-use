@@ -52,11 +52,23 @@ pub fn element_at(pid: i32, x: f64, y: f64) -> Option<Cf> {
 
 /// Whether the element sits inside a web area.
 pub fn in_web_view(e: AXRef) -> bool {
-    let mut cur = attr(e, "AXParent");
-    while let Some(c) = cur {
+    let mut cur = Some(Cf(unsafe { CFRetain(e) }));
+    for _ in 0..300 {
+        let Some(c) = cur else { break };
         if attr_str(c.0, "AXRole").as_deref() == Some("AXWebArea") {
             return true;
         }
+        cur = attr(c.0, "AXParent");
+    }
+    false
+}
+
+/// Codex's web-click preflight: does the hit element's parent chain contain this element?
+pub fn contains_hit(e: AXRef, pid: i32, at: crate::input::Pt) -> bool {
+    let mut cur = element_at(pid, at.x, at.y);
+    for _ in 0..300 {
+        let Some(c) = cur else { break };
+        if unsafe { CFEqual(e, c.0) } != 0 { return true; }
         cur = attr(c.0, "AXParent");
     }
     false

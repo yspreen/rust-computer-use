@@ -331,8 +331,10 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App, enforcer: &focus
                     None => center(e)?,
                 };
                 cursor::move_to(at, w);
-                let press = button == "left" && count == 1 && ax::actions(e.0).iter().any(|(n, _)| n == "AXPress");
-                if press && ax::perform(e.0, "AXPress").is_ok() {
+                let actions = ax::actions(e.0);
+                let action = ["AXPick", "AXPress"].into_iter().find(|name| actions.iter().any(|(n, _)| n == name));
+                let press = button == "left" && count == 1 && !(ax::in_web_view(e.0) && ax::contains_hit(e.0, app.pid, at));
+                if press && action.is_some_and(|a| ax::perform(e.0, a).is_ok()) {
                     cursor::press(1);
                     return Ok(());
                 }

@@ -40,6 +40,16 @@ extern "C" {
     fn CGEventSetDoubleValueField(e: Ev, field: u32, v: f64);
     fn CGEventSetType(e: Ev, ty: u32);
     fn CGEventPostToPid(pid: i32, e: Ev);
+    fn CGEventSetTimestamp(e: Ev, timestamp: u64);
+}
+
+extern "C" { fn clock_gettime_nsec_np(clock: u32) -> u64; }
+
+fn send(pid: i32, e: Ev) {
+    unsafe {
+        CGEventSetTimestamp(e, clock_gettime_nsec_np(8)); // CLOCK_UPTIME_RAW
+        CGEventPostToPid(pid, e);
+    }
 }
 
 #[link(name = "ApplicationServices", kind = "framework")]
@@ -88,7 +98,7 @@ pub(crate) fn post_app_event(pid: i32, subtype: i16, window: u32) {
     if let Some(ev) = ev {
         let cg: *const c_void = unsafe { objc2::msg_send![&*ev, CGEvent] };
         if !cg.is_null() {
-            unsafe { CGEventPostToPid(pid, cg) };
+            send(pid, cg);
         }
     }
 }
@@ -110,7 +120,7 @@ pub fn target(pid: i32, window: u32, origin: Pt) {
 /// Events go out back to back, as the original sends them; only presses keep a pace.
 fn post(e: Ev) {
     let e = Cf(e);
-    unsafe { CGEventPostToPid(PID.load(Relaxed), e.0) };
+    send(PID.load(Relaxed), e.0);
 }
 
 fn pause(ms: u64) {

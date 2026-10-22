@@ -48,6 +48,7 @@ pub(crate) fn symbol(name: &std::ffi::CStr) -> Option<usize> {
 struct Seen {
     any: bool,
     activated: bool,
+    deactivated: bool,
     at: Instant,
 }
 
@@ -143,7 +144,7 @@ extern "C" fn user_tap(_: *const c_void, ty: u32, e: Ev, ctx: *mut c_void) -> Ev
     let sub = i16::try_from(sub).ok();
     match (ty, sub) {
         (20, _) | (13, Some(1)) => (seen.any, seen.activated) = (true, true),
-        (19, _) | (13, Some(2)) => seen.any = true,
+        (19, _) | (13, Some(2)) => (seen.any, seen.deactivated) = (true, true),
         (13, Some(22 | 23)) => {}
         _ => return e,
     }
@@ -180,7 +181,7 @@ fn covered(user_window: u32, target: i32) -> bool {
 }
 
 /// The original's safelyEnforceActiveState(for:). `enforce` is its enforceActiveState.
-pub fn safely_enforce(target: i32, enforce: impl FnOnce()) -> Result<(), String> {
+fn safely_enforce(target: i32, target_seen: Arc<UserTap>, enforce: impl FnOnce()) -> Result<(), String> {
     let Some((user, user_app)) = front().filter(|(p, _)| *p != target) else {
         enforce();
         wait_frontmost(target, 0.25);
@@ -190,7 +191,7 @@ pub fn safely_enforce(target: i32, enforce: impl FnOnce()) -> Result<(), String>
     let user_win = ax::attr(user_el.0, "AXFocusedWindow");
     let user_win_id = user_win.as_ref().and_then(|w| ax::window_id(w.0));
 
-    let seen = Arc::new(UserTap { seen: Mutex::new(Seen { any: false, activated: false, at: Instant::now() }) });
+    let seen = Arc::new(UserTap { seen: Mutex::new(Seen { any: false, activated: false, deactivated: false, at: Instant::now() }) });
     let redirect = Arc::new(TargetTap { own: std::process::id() as i32, target, user });
     let taps = [
         Tap::start(Some(user), 0, &[13, 20, 19], user_tap, seen.clone()),
@@ -229,10 +230,11 @@ pub fn safely_enforce(target: i32, enforce: impl FnOnce()) -> Result<(), String>
                     }
                 }
                 let s = seen.seen.lock().unwrap();
-                let quiet = s.at.elapsed() >= Duration::from_millis(100);
-                if reactivated_at.is_some() && !s.activated {
+                let t = target_seen.seen.lock().unwrap();
+                let quiet = s.at.elapsed().min(t.at.elapsed()) >= Duration::from_millis(100);
+                if reactivated_at.is_some() && !(s.activated && s.deactivated) {
                     // Wait for the user's app to see itself activated again.
-                } else if !(reactivated_at.is_some() || s.any) || quiet {
+                } else if !(reactivated_at.is_some() || s.any || t.any) || quiet {
                     break Ok(());
                 }
             }
@@ -265,6 +267,7 @@ pub struct State {
     believes_active: bool,
     pub believes_focus: bool,
     active: bool,
+    suppression: Option<Arc<UserTap>>,
 }
 
 struct EnforcerContext {
@@ -276,6 +279,20 @@ extern "C" fn activation(_: Ev, ty: u32, e: Ev, ctx: *mut c_void) -> Ev {
     let ctx = unsafe { &*(ctx as *const EnforcerContext) };
     let mut s = ctx.state.lock().unwrap();
     let sub = unsafe { CGEventGetIntegerValueField(e, 83) };
+    if let Some(t) = &s.suppression {
+        let mut seen = t.seen.lock().unwrap();
+        seen.at = Instant::now();
+        match (ty, sub) {
+            (20, _) => seen.any = true,
+            (19, _) | (13, 2) => {
+                seen.any = true;
+                seen.deactivated = true;
+                return std::ptr::null();
+            }
+            (13, 22 | 23) => return std::ptr::null(),
+            _ => {}
+        }
+    }
     match (ty, sub) {
         (20, _) | (13, 1) => { s.believes_active = true; s.believes_focus = true; }
         (19, _) | (13, 2) if s.believes_active && !s.active => return std::ptr::null(),
@@ -313,7 +330,7 @@ pub struct Enforcer {
 impl Enforcer {
     pub fn new(pid: i32) -> Result<Self, String> {
         let active = crate::apps::frontmost() == Some(pid);
-        let state = Arc::new(Mutex::new(State { believes_active: active, believes_focus: false, active }));
+        let state = Arc::new(Mutex::new(State { believes_active: active, active, ..State::default() }));
         let preventer = crate::preventer::Preventer::register(pid, &state)?;
         state.lock().unwrap().believes_focus = preventer.focused(pid);
         let ctx = Arc::new(EnforcerContext { pid, state: state.clone() });
@@ -336,12 +353,16 @@ impl Enforcer {
 
     pub fn enforce(&self, point: Option<crate::input::Pt>) -> Result<(), String> {
         if self.believes_focus() { return Ok(()); }
-        safely_enforce(self.pid, || {
+        let seen = Arc::new(UserTap { seen: Mutex::new(Seen { any: false, activated: false, deactivated: false, at: Instant::now() }) });
+        self.state.lock().unwrap().suppression = Some(seen.clone());
+        let result = safely_enforce(self.pid, seen, || {
             crate::input::believe_active(self.pid, point);
             let mut s = self.state.lock().unwrap();
             s.believes_active = true;
             s.believes_focus = true;
-        })
+        });
+        self.state.lock().unwrap().suppression = None;
+        result
     }
 }
 

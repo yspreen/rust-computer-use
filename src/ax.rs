@@ -74,10 +74,22 @@ pub fn contains_hit(e: AXRef, pid: i32, at: crate::input::Pt) -> bool {
     false
 }
 
-/// Whether clicking the element may select text (text views and static text), so the app has
-/// to believe it is active first.
+/// Selection can come from any ancestor, up to the application, not just text roles.
 pub fn may_select(e: AXRef) -> bool {
-    matches!(attr_str(e, "AXRole").as_deref(), Some("AXTextField" | "AXTextArea" | "AXStaticText" | "AXComboBox"))
+    let mut cur = Some(Cf(unsafe { CFRetain(e) }));
+    for _ in 0..300 {
+        let Some(c) = cur else { break };
+        let role = attr_str(c.0, "AXRole");
+        if role.as_deref() == Some("AXApplication") { return false; }
+        if !matches!(role.as_deref(), Some("AXMenuItem" | "AXMenuBarItem")) && settable(c.0, "AXSelected") { return true; }
+        let mut names = std::ptr::null();
+        if unsafe { AXUIElementCopyAttributeNames(c.0, &mut names) } == 0 && !names.is_null() {
+            if array(&Cf(names as _)).into_iter().filter_map(to_string)
+                .any(|n| matches!(n.as_str(), "AXSelectedRows" | "AXSelectedCells" | "AXSelectedChildren")) { return true; }
+        }
+        cur = attr(c.0, "AXParent");
+    }
+    false
 }
 
 /// The window server number of a window element.

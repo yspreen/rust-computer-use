@@ -290,6 +290,7 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App, enforcer: &focus
         ax::frame(e.0).map(|(x, y, w, h)| Pt { x: x + w / 2.0, y: y + h / 2.0 }).ok_or(server_err("element has no frame"))
     };
     let f = |k: &str| a[k].as_f64().ok_or(format!("Missing required argument: {k}"));
+    let catalyst = ax::attr(ax::app_element(app.pid).0, "AXExhibitsMacCatalystBehavior").is_some_and(|v| ax::to_bool(v.0));
     // The original's focus enforcer: whenever the app no longer believes it has focus, it is
     // made to believe so with the user's app kept in front and the screen frozen.
     let enforce = || -> Result<(), String> {
@@ -309,7 +310,8 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App, enforcer: &focus
         let web = el.or(hit.as_ref()).is_some_and(|e| ax::in_web_view(e.0));
         if enforcer.believes_focus() {
             input::set_mouse_flags(0);
-        } else if web || hit.as_ref().is_some_and(|e| ax::may_select(e.0)) {
+        } else if web || hit.as_ref().is_some_and(|e| ax::may_select(e.0)
+            || (catalyst && ax::attr_str(e.0, "AXRole").as_deref() == Some("AXMenuButton"))) {
             enforce()?;
         } else {
             input::set_mouse_flags(0x100000);
@@ -334,6 +336,8 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App, enforcer: &focus
                 let actions = ax::actions(e.0);
                 let action = ["AXPick", "AXPress"].into_iter().find(|name| actions.iter().any(|(n, _)| n == name));
                 let press = button == "left" && count == 1 && !(ax::in_web_view(e.0) && ax::contains_hit(e.0, app.pid, at));
+                if press && action.is_some() && catalyst && !enforcer.believes_focus()
+                    && (ax::may_select(e.0) || ax::attr_str(e.0, "AXRole").as_deref() == Some("AXMenuButton")) { enforce()?; }
                 if press && action.is_some_and(|a| ax::perform(e.0, a).is_ok()) {
                     cursor::press(1);
                     return Ok(());

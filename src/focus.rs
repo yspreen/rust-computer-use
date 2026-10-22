@@ -6,11 +6,12 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-type Ev = *const c_void;
-type TapCallback = extern "C" fn(*const c_void, u32, Ev, *mut c_void) -> Ev;
+pub type Ev = *const c_void;
+pub type TapCallback = extern "C" fn(*const c_void, u32, Ev, *mut c_void) -> Ev;
 
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
+    fn CGEventTapCreate(loc: u32, place: u32, options: u32, mask: u64, cb: TapCallback, ctx: *mut c_void) -> *const c_void;
     fn CGEventTapCreateForPid(pid: i32, place: u32, options: u32, mask: u64, cb: TapCallback, ctx: *mut c_void) -> *const c_void;
     fn CGEventTapEnable(tap: *const c_void, on: bool);
     fn CGEventGetIntegerValueField(e: Ev, field: u32) -> i64;
@@ -47,23 +48,45 @@ struct Seen {
     at: Instant,
 }
 
-/// A CGEventTapCreateForPid tap (head insert, active) running on its own thread, as the
-/// original's EventTap does.
-struct Tap {
+/// An active event tap running on its own thread, as the original's EventTap does. `pid` taps
+/// one process (CGEventTapCreateForPid); None taps the annotated session.
+pub struct Tap {
     port: usize,
     run_loop: usize,
 }
 
+/// What a tap's trampoline needs: the real callback, its context, and the tap to re-enable.
+struct Hook {
+    cb: TapCallback,
+    ctx: usize,
+    port: std::sync::atomic::AtomicUsize,
+}
+
+/// Re-enable a tap the system disabled (timeout or user input), as the original does; pass
+/// everything else on.
+extern "C" fn trampoline(proxy: *const c_void, ty: u32, e: Ev, hook: *mut c_void) -> Ev {
+    let hook = unsafe { &*(hook as *const Hook) };
+    if ty == 0xFFFF_FFFE || ty == 0xFFFF_FFFF {
+        unsafe { CGEventTapEnable(hook.port.load(std::sync::atomic::Ordering::Relaxed) as _, true) };
+        return e;
+    }
+    (hook.cb)(proxy, ty, e, hook.ctx as _)
+}
+
 impl Tap {
-    fn start(pid: i32, types: &[u32], cb: TapCallback, ctx: *mut c_void) -> Option<Tap> {
+    pub fn start(pid: Option<i32>, place: u32, types: &[u32], cb: TapCallback, ctx: *mut c_void) -> Option<Tap> {
         let mask = types.iter().fold(0u64, |m, t| m | 1 << t);
-        let ctx = ctx as usize;
+        let hook = Box::into_raw(Box::new(Hook { cb, ctx: ctx as usize, port: Default::default() })) as usize;
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || unsafe {
-            let port = CGEventTapCreateForPid(pid, 0, 0, mask, cb, ctx as _);
+            let port = match pid {
+                Some(pid) => CGEventTapCreateForPid(pid, place, 0, mask, trampoline, hook as _),
+                None => CGEventTapCreate(2, place, 0, mask, trampoline, hook as _), // kCGAnnotatedSessionEventTap
+            };
             if port.is_null() {
                 return tx.send(None).unwrap();
             }
+            (*(hook as *const Hook)).port.store(port as usize, std::sync::atomic::Ordering::Relaxed);
             let src = Cf(CFMachPortCreateRunLoopSource(std::ptr::null(), port, 0));
             let rl = CFRunLoopGetCurrent();
             CFRunLoopAddSource(rl, src.0, kCFRunLoopCommonModes);
@@ -71,6 +94,7 @@ impl Tap {
             tx.send(Some(Tap { port: port as usize, run_loop: CFRetain(rl) as usize })).unwrap();
             CFRunLoopRun();
             drop(Cf(port));
+            drop(Box::from_raw(hook as *mut Hook));
         });
         rx.recv().ok().flatten()
     }
@@ -95,9 +119,6 @@ struct UserTap {
 /// user's app never learns it lost the front. Types 13 (AppKit-defined, subtype 1 activated,
 /// 2 deactivated, 22/23 window resigned key/main appearance), 20 and 19.
 extern "C" fn user_tap(_: *const c_void, ty: u32, e: Ev, ctx: *mut c_void) -> Ev {
-    if ty == 0xFFFF_FFFE || ty == 0xFFFF_FFFF {
-        return e;
-    }
     let state = unsafe { &*(ctx as *const UserTap) };
     let mut seen = state.seen.lock().unwrap();
     seen.at = Instant::now();
@@ -119,10 +140,7 @@ struct TargetTap {
 }
 
 /// On the target: keys the user types while the target is briefly active go to the user's app.
-extern "C" fn target_tap(_: *const c_void, ty: u32, e: Ev, ctx: *mut c_void) -> Ev {
-    if ty == 0xFFFF_FFFE || ty == 0xFFFF_FFFF {
-        return e;
-    }
+extern "C" fn target_tap(_: *const c_void, _ty: u32, e: Ev, ctx: *mut c_void) -> Ev {
     let t = unsafe { &*(ctx as *const TargetTap) };
     let field = |f| unsafe { CGEventGetIntegerValueField(e, f) } as i32;
     if field(41) != t.own && field(40) == t.target {
@@ -158,8 +176,8 @@ pub fn safely_enforce(target: i32, enforce: impl FnOnce()) -> Result<(), String>
     let seen = Arc::new(UserTap { seen: Mutex::new(Seen { any: false, activated: false, at: Instant::now() }) });
     let redirect = Arc::new(TargetTap { own: std::process::id() as i32, target, user });
     let taps = [
-        Tap::start(user, &[13, 20, 19], user_tap, Arc::as_ptr(&seen) as _),
-        Tap::start(target, &[10, 11, 12], target_tap, Arc::as_ptr(&redirect) as _),
+        Tap::start(Some(user), 0, &[13, 20, 19], user_tap, Arc::as_ptr(&seen) as _),
+        Tap::start(Some(target), 0, &[10, 11, 12], target_tap, Arc::as_ptr(&redirect) as _),
     ];
 
     let cid = spi(c"CGSMainConnectionID").map_or(0, |f| f(0));

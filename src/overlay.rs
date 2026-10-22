@@ -4,6 +4,11 @@ use block2::RcBlock;
 use objc2::MainThreadMarker;
 use objc2_app_kit::*;
 use std::sync::Mutex;
+
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGEventGetIntegerValueField(e: *const std::ffi::c_void, field: u32) -> i64;
+}
 use std::time::{Duration, Instant};
 
 /// Last agent action, and when the user pressed Esc during a session.
@@ -21,6 +26,11 @@ pub fn run(work: impl FnOnce() + Send + 'static) -> ! {
     let input = RcBlock::new(|e: std::ptr::NonNull<NSEvent>| {
         let e = unsafe { e.as_ref() };
         let key = e.r#type() == NSEventType::KeyDown;
+        // Keys this process posted (field 41, kCGEventSourceUnixProcessID) are the agent's own.
+        let cg: *const std::ffi::c_void = unsafe { objc2::msg_send![e, CGEvent] };
+        if !cg.is_null() && unsafe { CGEventGetIntegerValueField(cg, 41) } == std::process::id() as i64 {
+            return;
+        }
         let recent = ACTIVE.lock().unwrap().is_some_and(|t| t.elapsed() < SESSION_IDLE);
         if key && e.keyCode() == 53 && recent {
             *STOPPED.lock().unwrap() = Some(Instant::now());

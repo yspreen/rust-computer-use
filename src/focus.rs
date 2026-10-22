@@ -140,7 +140,7 @@ extern "C" fn user_tap(_: *const c_void, ty: u32, e: Ev, ctx: *mut c_void) -> Ev
     let state = unsafe { &*(ctx as *const UserTap) };
     let mut seen = state.seen.lock().unwrap();
     seen.at = Instant::now();
-    let sub = unsafe { CGEventGetIntegerValueField(e, 83) };
+    let sub = unsafe { CGEventGetIntegerValueField(e, 99) };
     let sub = i16::try_from(sub).ok();
     match (ty, sub) {
         (20, _) | (13, Some(1)) => (seen.any, seen.activated) = (true, true),
@@ -278,7 +278,7 @@ struct EnforcerContext {
 extern "C" fn activation(_: Ev, ty: u32, e: Ev, ctx: *mut c_void) -> Ev {
     let ctx = unsafe { &*(ctx as *const EnforcerContext) };
     let mut s = ctx.state.lock().unwrap();
-    let sub = unsafe { CGEventGetIntegerValueField(e, 83) };
+    let sub = unsafe { CGEventGetIntegerValueField(e, 99) };
     if let Some(t) = &s.suppression {
         let mut seen = t.seen.lock().unwrap();
         seen.at = Instant::now();
@@ -295,8 +295,6 @@ extern "C" fn activation(_: Ev, ty: u32, e: Ev, ctx: *mut c_void) -> Ev {
     }
     match (ty, sub) {
         (20, _) | (13, 1) => { s.believes_active = true; s.believes_focus = true; }
-        (19, _) | (13, 2) if s.believes_active && !s.active => return std::ptr::null(),
-        (13, 22 | 23) if s.believes_active && !s.active => return std::ptr::null(),
         (19, _) | (13, 2) => { s.believes_active = false; s.believes_focus = false; }
         _ => {}
     }

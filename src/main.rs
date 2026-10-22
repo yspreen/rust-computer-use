@@ -327,11 +327,9 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App, enforcer: &focus
             let w = snap.window_id;
             if a.get("element_index").is_some() {
                 let e = elem()?;
-                // Element clicks land on the activation point, else the frame center.
-                let at = match input::ax_point(e.0, "AXActivationPoint") {
-                    Some(p) => p,
-                    None => center(e)?,
-                };
+                // clickablePoint(scrollToVisible: false) uses the element's frame center.
+                // Chrome can expose an AXActivationPoint outside the element entirely.
+                let at = center(e)?;
                 cursor::move_to(at, w);
                 let actions = ax::actions(e.0);
                 let action = ["AXPick", "AXPress"].into_iter().find(|name| actions.iter().any(|(n, _)| n == name));

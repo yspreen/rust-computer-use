@@ -1,0 +1,85 @@
+# Background input investigation
+
+Target is Codex Computer Use 1001501, arm64 `SkyComputerUseService`.
+SHA-256: `f21c31c0ee5df419dbd165bf76ebd65c64d864c6fec5b6c6c3a23c42ff3d2e13`.
+REA signature evidence: `ev_af94b3bdaabd8fc2df405a412b0d6627e5e3d037f1870ce970ebb66e4f6f5814`.
+This establishes artifact identity and its OpenAI signature, not runtime behavior.
+
+The findings below come from the existing Ghidra project at
+`/tmp/cua/gh/quick/svc`, checked against arm64 instructions. They are ordinary
+Ghidra/disassembly observations, not successful REA function Evidence. REA's
+fresh Ghidra import exceeded both 330 s and 900 s startup deadlines. Hopper
+launch failed because macOS denied Automation permission. No client settings
+were changed. Focused decompiles and live logs are in `/tmp/cua/continuation`.
+
+## Recovered behavior
+
+- Enforcer state is three bytes: believes active, believes focused, actually
+  active. Init at `0x1007470b0`, event callback at `0x10074750c`.
+  Activation events set the first two bytes together. Real front-app changes
+  only update the third byte, through `0x1007515b0`.
+- A temporary event filter runs before normal enforcer tracking during safe
+  activation. It drops target deactivation and resigned-key/main appearance
+  events. `0x10074bfc8` records activation/deactivation observations separately.
+- The safe wrapper freezes updates, redirects real keys during the switch,
+  restores the original front app and its window, and removes temporary filters.
+  Poll interval is 10 ms, activation retry 50 ms, quiet interval 100 ms, deadline
+  2 s. Entry `0x100748370`, continuations `0x1007498ec`, `0x10074a96c`.
+- System focus protection watches process notifications, independently of app
+  activation. Taken is dropped, Changed releases the recorded focus ID once,
+  and one matching Returned is dropped. Real keys addressed to the thief go to
+  the prior owner; self-posted keys pass. Source functions are in
+  `/tmp/cua/gh/FSP`; original behavioral specification is
+  `/tmp/cua/spec/focus_steal_preventer.md`.
+- The global click watcher lets the user activate a synthetically active app
+  normally. It passes the click after activation, rather than dropping it.
+  Callback `0x100751108`.
+- Normal element clicks use frame center, not AXActivationPoint.
+  `0x1007a508c` gets the frame through `0x1007a6838` and returns its midpoint.
+  The full original also checks ancestor clipping and has a Chess-specific
+  point search. Those paths are not yet ported.
+- For a visible web element, the original hit-tests its click point and searches
+  the hit element's ancestors for the requested element. A match selects mouse
+  input instead of AXPress. `0x1007bee04`, `0x1007beefc`, `0x1007be664` and
+  `0x1007b8190` establish that path.
+- Selection-sensitive clicks check the element and its ancestors, up to 300
+  levels, for settable AXSelected or supported AXSelectedRows/Cells/Children.
+  Menu items and menu bar items do not count as individually selectable.
+  `0x1007ae150`, `0x100795630`, `0x1007b67f0`.
+- Synthesized events receive a fresh uptime timestamp immediately before posting.
+  `0x10075ad0c`.
+
+## Live checks and limits
+
+The isolated Chrome page is `/tmp/cua/continuation/input.html`. It has a named
+input and a click counter. The original implementation passed the sequence
+Cmd+L, address typing, Escape, click the page field, type into that field.
+`original.log` records the exact field value. Finder remained frontmost in
+`focus-original.log`.
+
+The first Rust assertion was too broad: it accepted text anywhere in the AX
+response, including the omnibox. It is not evidence of correct field typing.
+The stricter regression failed before the frame-center fix. Its event trace
+showed a click at `(0,1329)`. A separate read-only AX probe confirmed Chrome
+reported that bogus AXActivationPoint while the input's actual frame was
+`(2143,1584,278,64)`. The frame-center fix has built but still needs its live
+regression run.
+
+Concurrent relay restarts also produced competing service instances. The service
+now holds an exclusive process lock before replacing the socket. Relaunch and
+session-teardown checks remain part of the next live batch.
+
+Remaining fidelity work includes menu-dismissal suppression, the ViewBridge to
+ViewBridge special release/notification path, exact exceptional host resolution,
+ancestor clipping and the Chess-specific click-point search. Screen-update
+suppression and safe-wrapper completion still need a visual check. Full parity
+must not be claimed until those paths are resolved or explicitly scoped out.
+
+## Next live batch
+
+Only run after the user says they have stepped away. Keep one service instance.
+Repeat the strict Chrome field test, then coordinate clicks, Unicode text,
+synthetic Escape, native TextEdit, focus changes between actions, and session
+cleanup. Capture front/key-focus observations alongside a screen recording.
+Close only test windows afterward. End the turn before requesting the user's
+next away period.

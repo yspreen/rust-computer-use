@@ -100,3 +100,27 @@ logged every 20 ms and the screen recorded.
 - Window screenshots of Chrome are blank white while the omnibox popup is open.
   `screencapture -l` on the main window returns white too, so window selection
   is not the cause.
+
+## Recovered and ported, 2026-10-24 (continued)
+
+Persistent Ghidra project at `/tmp/cua-re/gh/proj` (import about 90 min,
+then about 5 s per function with `Dec.java`). REA CLI evidence for the import:
+`ev_36a8f102c387a356ed92154cddf7cac08c0e772d2ddb430b79c6d7f81ae2fade`.
+
+- ViewBridge host (`0x100759300`): polls only when the last synthesized action
+  was under 1 s ago. That time is written only by
+  `synthesizedActionWasPerformed` (`0x10074c9f4`), which has no callers, so the
+  agent-host resolver (`0x100757e70`) always runs. Our `classify` matches it.
+- ViewBridge-to-ViewBridge focus change (`0x1007552d0`): see commit e8a30ac.
+  `UIElement.ProcessType` (`0x100794e84`): 0 launched regular app, 1 launched
+  prohibited app, 2 otherwise. `containingElement` (`0x100794b38`) walks the
+  parent chain including self, up to 300 levels.
+- `clickablePoint()` (`0x1007a506c`): frame midpoint clipped by scroll areas,
+  scrolling groups, and the enclosing window, sheet, menu or popover. Nil makes
+  a mouse click throw `cannotClickOffscreenElement` (SynthesizedEvent.Error 3).
+- `scrollToVisible(frame:)` (`0x1007a5d40`, `0x1007a5dd0`, `0x1007a7298`):
+  ported in commit fa8ec42. Scroll-bar arithmetic is a best reading.
+- Chess (`0x1007a54e0`): AXButton in `com.apple.Chess` whose center misses it;
+  centroid of exact hits on a 64x64 grid. Unresolved: the string test in
+  `0x1007a9ee0` (first character from a set built at run time, second in
+  `1`..`8`, likely a board square name) and `0x10075e4dc`.

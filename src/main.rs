@@ -532,7 +532,8 @@ fn render(app: &apps::App) -> Result<(ax::Tree, Cf), String> {
 fn state(snaps: &mut HashMap<i32, Snapshot>, app: &apps::App, full: bool) -> Result<Value, String> {
     let (tree, win) = render(app)?;
     let frame = ax::frame(win.0).ok_or(server_err("window has no frame"))?;
-    let window_id = window_id(app.pid, frame).unwrap_or(0);
+    // The AX window's own number; a frame match alone can pick a same-sized popup (Chrome's omnibox).
+    let window_id = ax::window_id(win.0).or_else(|| window_id(app.pid, frame)).unwrap_or(0);
     // The window server's title first (Chrome's omits the app name), then the AX title.
     let title = window_name(window_id).or_else(|| ax::attr_str(win.0, "AXTitle")).unwrap_or_default();
     let window = format!("Window: \"{title}\", App: {}.\n{}", app.name, tree.text);

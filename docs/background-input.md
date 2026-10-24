@@ -83,3 +83,20 @@ synthetic Escape, native TextEdit, focus changes between actions, and session
 cleanup. Capture front/key-focus observations alongside a screen recording.
 Close only test windows afterward. End the turn before requesting the user's
 next away period.
+
+## Live batch, 2026-10-24 (main at 8faf5d6)
+
+Test page `/tmp/cua-test/input.html` in background Chrome, with the front app
+logged every 20 ms and the screen recorded.
+
+- Element click on the page field, then typing: field value is exactly the typed
+  text. Coordinate click on a button: its counter went from 0 to 1.
+- Cmd+L, Unicode text (`üñí 日本 ✓`), synthetic Escape: all reached Chrome and
+  the session survived the Escape.
+- A second Cmd+L run kept the user's app frontmost the whole time. The
+  recording shows no Chrome or TextEdit frames during it.
+- TextEdit: typing and Cmd+A work. "native ok" became "Native ok" after Cmd+A;
+  probably system auto-capitalization, not confirmed.
+- Window screenshots of Chrome are blank white while the omnibox popup is open.
+  `screencapture -l` on the main window returns white too, so window selection
+  is not the cause.

@@ -324,6 +324,33 @@ pub fn perform(e: AXRef, action: &str) -> Result<(), String> {
 }
 
 /// Element frame in global screen points: (x, y, w, h).
+/// UIElementProtocol.clickablePoint(): the frame's midpoint, or None when the ancestors that
+/// clip it (scroll areas, groups with a scroll action, and the enclosing window, sheet, menu or
+/// popover) leave that point hidden.
+pub fn clickable_point(e: AXRef) -> Option<(f64, f64)> {
+    let (x, y, w, h) = frame(e)?;
+    let mid = (x + w / 2.0, y + h / 2.0);
+    let mut vis = (f64::NEG_INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::INFINITY); // x0, y0, x1, y1
+    let mut cur = Some(Cf(unsafe { CFRetain(e) }));
+    while let Some(c) = cur {
+        let role = attr_str(c.0, "AXRole");
+        let top = matches!(role.as_deref(), Some("AXWindow" | "AXSheet" | "AXMenu" | "AXPopover"));
+        match role.as_deref() {
+            Some("AXApplication") => break,
+            Some("AXScrollArea") => {}
+            Some("AXGroup") if actions(c.0).iter().any(|(n, _)| n.starts_with("AXScroll")) => {}
+            _ if top => {}
+            _ => { cur = attr(c.0, "AXParent"); continue; }
+        }
+        let (fx, fy, fw, fh) = frame(c.0)?;
+        vis = (vis.0.max(fx), vis.1.max(fy), vis.2.min(fx + fw), vis.3.min(fy + fh));
+        if vis.0 >= vis.2 || vis.1 >= vis.3 { return None; }
+        if top { break; }
+        cur = attr(c.0, "AXParent");
+    }
+    (mid.0 >= vis.0 && mid.0 < vis.2 && mid.1 >= vis.1 && mid.1 < vis.3).then_some(mid)
+}
+
 pub fn frame(e: AXRef) -> Option<(f64, f64, f64, f64)> {
     let (mut p, mut s) = ([0f64; 2], [0f64; 2]);
     let pos = attr(e, "AXPosition")?;

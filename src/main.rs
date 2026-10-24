@@ -328,10 +328,11 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App, enforcer: &focus
             let w = snap.window_id;
             if a.get("element_index").is_some() {
                 let e = elem()?;
-                // clickablePoint(scrollToVisible: false) uses the element's frame center.
+                // clickablePoint(): the frame center if the clipping ancestors leave it visible.
                 // Chrome can expose an AXActivationPoint outside the element entirely.
-                let at = center(e)?;
-                cursor::move_to(at, w);
+                let point = ax::clickable_point(e.0).map(|(x, y)| Pt { x, y });
+                let at = point.unwrap_or(center(e)?);
+                if point.is_some() { cursor::move_to(at, w); }
                 let actions = ax::actions(e.0);
                 let action = ["AXPick", "AXPress"].into_iter().find(|name| actions.iter().any(|(n, _)| n == name));
                 let press = button == "left" && count == 1 && !(ax::in_web_view(e.0) && ax::contains_hit(e.0, app.pid, at));
@@ -341,6 +342,7 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App, enforcer: &focus
                     cursor::press(1);
                     return Ok(());
                 }
+                let at = point.ok_or(server_err("cannotClickOffscreenElement"))?;
                 prepare_click(Some(e), at)?;
                 click_with_cursor(at, button, count, false);
             } else {

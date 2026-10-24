@@ -70,6 +70,31 @@ fn classify(pid: i32, vb: Option<i32>) -> Owner {
     Owner { pid: host, view_bridge }
 }
 
+/// UIElement.ProcessType: 0 a launched regular app, 1 a launched background-only (prohibited) app,
+/// 2 anything else.
+fn process_type(pid: i32) -> u8 {
+    match NSRunningApplication::runningApplicationWithProcessIdentifier(pid) {
+        Some(a) if a.isFinishedLaunching() => (a.activationPolicy() == NSApplicationActivationPolicy::Prohibited) as u8,
+        _ => 2,
+    }
+}
+
+/// The app owning the host's focused element or its nearest ancestor (at most 300 levels) that
+/// belongs to a launched app, with that app's process type: containingElement(for:ofTypes:[1,0]).
+fn containing_app(host: i32) -> Option<(i32, u8)> {
+    let mut e = ax::attr(ax::app_element(host).0, "AXFocusedUIElement");
+    for _ in 0..=300 {
+        let el = e?;
+        let mut pid = 0;
+        if unsafe { AXUIElementGetPid(el.0, &mut pid) } == 0 {
+            let t = process_type(pid);
+            if t < 2 { return Some((pid, t)); }
+        }
+        e = ax::attr(el.0, "AXParent");
+    }
+    None
+}
+
 struct Pending {
     thief: i32,
     app: Option<i32>,
@@ -156,12 +181,12 @@ extern "C" fn notifications(_: Ev, _: u32, e: Ev, ctx: *mut c_void) -> Ev {
     let shared = unsafe { &*(ctx as *const Shared) };
     let (target, sub, subject) = (field(e, 40) as i32, field(e, 64) as u16, field(e, 73) as i32);
     let owner = matches!(sub, 0x4000 | 0xf102).then(|| classify(subject, shared.vb));
+    let thief = |pid: Option<i32>| shared.registrations.lock().unwrap().iter().any(|r| Some(r.0) == pid);
     let mut state = shared.focus.lock().unwrap();
     match sub {
         0x4000 => {
             let owner = owner.unwrap();
-            let thief = shared.registrations.lock().unwrap().iter().any(|r| Some(r.0) == owner.pid);
-            state.pending = if thief && owner.pid != state.current.pid {
+            state.pending = if thief(owner.pid) && owner.pid != state.current.pid {
                 Some(Pending { thief: subject, app: owner.pid, victim: target, released: false, returned: false })
             } else { None };
             if state.pending.is_some() { return std::ptr::null(); }
@@ -187,6 +212,20 @@ extern "C" fn notifications(_: Ev, _: u32, e: Ev, ctx: *mut c_void) -> Ev {
                 if p.thief == subject {
                     if !p.released { p.released = true; release = true; }
                 } else if p.victim != subject { state.pending = None; }
+            }
+            // Between two ViewBridge-hosted views, look at who really holds the new host's
+            // focused element: an agent app gets a synthetic Taken/Returned pair instead.
+            if !release && prev.view_bridge && owner.view_bridge && thief(owner.pid) && prev.pid != owner.pid {
+                match owner.pid.and_then(containing_app) {
+                    Some((pid, _)) if thief(Some(pid)) => {}
+                    Some((_, 1)) => if let Some(prev) = prev.pid {
+                        std::thread::spawn(move || for sub in [0x4000, 0x8000u16] {
+                            crate::input::post_other_event(prev, 21, sub as i16, 0); // processNotification
+                        });
+                    },
+                    Some(_) => release = true,
+                    None => {}
+                }
             }
             let ok = release && crate::focus::symbol(c"CPSReleaseKeyFocusWithID").is_some_and(|f| {
                 let f: extern "C" fn(u32) -> i32 = unsafe { std::mem::transmute(f) };

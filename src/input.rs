@@ -90,10 +90,15 @@ pub fn believe_active(pid: i32, activation: Option<Pt>) {
 }
 
 pub(crate) fn post_app_event(pid: i32, subtype: i16, window: u32) {
+    post_other_event(pid, 13, subtype, window); // NSEventTypeAppKitDefined
+}
+
+/// An "other" NSEvent (location zero, timestamp now) converted to a CGEvent and posted to `pid`.
+pub(crate) fn post_other_event(pid: i32, ty: usize, subtype: i16, window: u32) {
     use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType};
     let flags = NSEventModifierFlags(if window == 0 { 0 } else { 0xc0000 });
     let ev = NSEvent::otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2(
-        NSEventType::AppKitDefined, objc2_foundation::NSPoint::ZERO, flags, 0.0, window as isize, None, subtype, 0, 0,
+        NSEventType(ty), objc2_foundation::NSPoint::ZERO, flags, 0.0, window as isize, None, subtype, 0, 0,
     );
     if let Some(ev) = ev {
         let cg: *const c_void = unsafe { objc2::msg_send![&*ev, CGEvent] };

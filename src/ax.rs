@@ -328,6 +328,7 @@ pub fn perform(e: AXRef, action: &str) -> Result<(), String> {
 /// clip it (scroll areas, groups with a scroll action, and the enclosing window, sheet, menu or
 /// popover) leave that point hidden.
 pub fn clickable_point(e: AXRef) -> Option<(f64, f64)> {
+    if let Some(p) = chess_point(e) { return Some(p); }
     let (x, y, w, h) = frame(e)?;
     let mid = (x + w / 2.0, y + h / 2.0);
     let mut vis = (f64::NEG_INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::INFINITY); // x0, y0, x1, y1
@@ -349,6 +350,28 @@ pub fn clickable_point(e: AXRef) -> Option<(f64, f64)> {
         cur = attr(c.0, "AXParent");
     }
     (mid.0 >= vis.0 && mid.0 < vis.2 && mid.1 >= vis.1 && mid.1 < vis.3).then_some(mid)
+}
+
+/// Chess board squares are buttons whose centers can hit a piece instead. When the center does
+/// not reach the button, click the centroid of the cells of a 64 x 64 grid over its frame that
+/// hit exactly it.
+fn chess_point(e: AXRef) -> Option<(f64, f64)> {
+    use objc2_app_kit::NSRunningApplication;
+    let p = pid(e)?;
+    let bundle = NSRunningApplication::runningApplicationWithProcessIdentifier(p)?.bundleIdentifier()?;
+    if attr_str(e, "AXRole").as_deref() != Some("AXButton") || bundle.to_string() != "com.apple.Chess" { return None; }
+    let (x, y, w, h) = frame(e)?;
+    if contains_hit(e, p, crate::input::Pt { x: x + w / 2.0, y: y + h / 2.0 }) { return None; }
+    let (mut sx, mut sy, mut n) = (0.0, 0.0, 0.0);
+    for j in 0..64 {
+        for i in 0..64 {
+            let (px, py) = (x + w / 64.0 * (i as f64 + 0.5), y + h / 64.0 * (j as f64 + 0.5));
+            if element_at(p, px, py).is_some_and(|hit| unsafe { CFEqual(hit.0, e) } != 0) {
+                (sx, sy, n) = (sx + px, sy + py, n + 1.0);
+            }
+        }
+    }
+    (n > 0.0).then(|| (sx / n, sy / n))
 }
 
 pub fn frame(e: AXRef) -> Option<(f64, f64, f64, f64)> {

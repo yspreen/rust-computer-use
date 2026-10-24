@@ -330,6 +330,7 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App, enforcer: &focus
                 let e = elem()?;
                 // clickablePoint(): the frame center if the clipping ancestors leave it visible.
                 // Chrome can expose an AXActivationPoint outside the element entirely.
+                ax::scroll_to_visible(e.0);
                 let point = ax::clickable_point(e.0).map(|(x, y)| Pt { x, y });
                 let at = point.unwrap_or(center(e)?);
                 if point.is_some() { cursor::move_to(at, w); }

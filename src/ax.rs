@@ -352,6 +352,93 @@ pub fn clickable_point(e: AXRef) -> Option<(f64, f64)> {
     (mid.0 >= vis.0 && mid.0 < vis.2 && mid.1 >= vis.1 && mid.1 < vis.3).then_some(mid)
 }
 
+type Rect = (f64, f64, f64, f64);
+
+fn children(e: AXRef) -> Vec<Cf> {
+    attr(e, "AXChildren").map(|v| array(&v).iter().map(|&c| Cf(unsafe { CFRetain(c) })).collect()).unwrap_or_default()
+}
+
+fn number(v: CFTypeRef) -> Option<f64> {
+    let mut f = 0f64;
+    (unsafe { CFGetTypeID(v) == CFNumberGetTypeID() && CFNumberGetValue(v as _, kCFNumberFloat64Type, &mut f as *mut f64 as _) }).then_some(f)
+}
+
+/// UIElementProtocol.scrollToVisible(frame:), run before every element click: walking up from the
+/// element to its window, sheet, menu or popover, perform AXScrollToVisible where offered, set it
+/// on cells that take it, and scroll each scroll area so the frame shows. If anything scrolled,
+/// wait up to 0.5 s (polling every 25 ms) for the frame center to become visible.
+pub fn scroll_to_visible(e: AXRef) {
+    let Some(target) = frame(e) else { return };
+    let mut scrolled = false;
+    let mut cur = Some(Cf(unsafe { CFRetain(e) }));
+    while let Some(c) = cur {
+        let role = attr_str(c.0, "AXRole");
+        if matches!(role.as_deref(), Some("AXWindow" | "AXSheet" | "AXMenu" | "AXPopover")) { break; }
+        if actions(c.0).iter().any(|(n, _)| n == "AXScrollToVisible") {
+            scrolled |= perform(c.0, "AXScrollToVisible").is_ok();
+        }
+        if role.as_deref() == Some("AXCell") && settable(c.0, "AXScrollToVisible") {
+            scrolled |= set_bool(c.0, "AXScrollToVisible", true).is_ok();
+        }
+        if role.as_deref() == Some("AXScrollArea") {
+            scrolled |= scroll_area(c.0, target);
+        }
+        cur = attr(c.0, "AXParent");
+    }
+    if scrolled {
+        let start = std::time::Instant::now();
+        while clickable_point(e).is_none() && start.elapsed().as_secs_f64() < 0.5 {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+}
+
+/// Scroll one scroll area so `t` shows: per axis where `t` sticks out, move that axis's scroll bar
+/// (centering `t` when it fits, else aligning the nearer edge), with the scrollable length taken
+/// from the union of the non-scroll-bar children. Without a usable scroll bar, fall back to
+/// AXMakeScreenRectVisible.
+fn scroll_area(area: AXRef, t: Rect) -> bool {
+    if !(t.2 > 0.0 && t.3 > 0.0 && t.2.is_finite() && t.3.is_finite()) { return false; }
+    let Some(a) = frame(area) else { return false };
+    if t.0 >= a.0 && t.1 >= a.1 && t.0 + t.2 <= a.0 + a.2 && t.1 + t.3 <= a.1 + a.3 { return false; }
+    let mut content: Option<Rect> = None;
+    for child in children(area) {
+        if attr_str(child.0, "AXRole").as_deref() == Some("AXScrollBar") { continue; }
+        if let Some(f) = frame(child.0) {
+            content = Some(match content {
+                None => f,
+                Some(c) => { let (x0, y0) = (c.0.min(f.0), c.1.min(f.1)); (x0, y0, (c.0 + c.2).max(f.0 + f.2) - x0, (c.1 + c.3).max(f.1 + f.3) - y0) }
+            });
+        }
+    }
+    let mut moved = false;
+    for (bar_attr, (t0, tl), (a0, al), (c0, cl)) in [
+        ("AXHorizontalScrollBar", (t.0, t.2), (a.0, a.2), content.map_or((0.0, 0.0), |c| (c.0, c.2))),
+        ("AXVerticalScrollBar", (t.1, t.3), (a.1, a.3), content.map_or((0.0, 0.0), |c| (c.1, c.3))),
+    ] {
+        let (t1, a1) = (t0 + tl, a0 + al);
+        if !(t0 < a0 || t1 > a1) { continue; }
+        let Some(bar) = attr(area, bar_attr) else { continue };
+        if attr(bar.0, "AXEnabled").is_some_and(|v| !to_bool(v.0)) { continue; }
+        let range = cl - al;
+        if range <= 0.0 { continue; }
+        let delta = if tl <= al { (t0 + t1 - a0 - a1) * 0.5 } else if a0 <= t0 { if t1 <= a1 { continue } t1 - a1 } else { t0 - a0 };
+        let current = match attr(bar.0, "AXValue").and_then(|v| number(v.0)) {
+            Some(v) => range * v.clamp(0.0, 1.0),
+            None => a0 - c0,
+        };
+        let value = ((current + delta).clamp(0.0, range) / range).clamp(0.0, 1.0);
+        let n = Cf(unsafe { CFNumberCreate(std::ptr::null(), kCFNumberFloat64Type, &value as *const f64 as _) } as _);
+        moved |= set_attr(bar.0, "AXValue", n.0).is_ok();
+    }
+    if !moved && settable(area, "AXMakeScreenRectVisible") {
+        let r = [t.0, t.1, t.2, t.3];
+        let v = Cf(unsafe { AXValueCreate(3, r.as_ptr() as _) }); // kAXValueCGRectType
+        moved = set_attr(area, "AXMakeScreenRectVisible", v.0).is_ok();
+    }
+    moved
+}
+
 /// Chess board squares are buttons whose centers can hit a piece instead. When the center does
 /// not reach the button, click the centroid of the cells of a 64 x 64 grid over its frame that
 /// hit exactly it.

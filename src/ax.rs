@@ -655,7 +655,9 @@ fn fetch(e: AXRef, depth: usize, max_depth: usize, budget: &mut usize, browser: 
     let (children_raw, subset) = if depth >= max_depth || rows.is_empty() {
         (children_raw, None)
     } else if rows.len() < 500 {
-        (rows, None)
+        // Rows, then whatever else the table holds besides rows and columns (its header).
+        let rest = children_raw.iter().copied().filter(|&c| !matches!(attr_str(c, "AXRole").as_deref(), Some("AXRow" | "AXColumn")));
+        (rows.into_iter().chain(rest).collect(), None)
     } else {
         let visible = kids(20);
         let mut ranges: Vec<(usize, usize)> = vec![];
@@ -930,6 +932,7 @@ fn transform(mut n: Node) -> Option<Node> {
                 Some(last) if text && run => {
                     let v = last.value.take().unwrap_or_default();
                     last.value = Some(format!("{v} {}", c.value.unwrap_or_default()));
+                    last.children = c.children; // the earlier label's children are lost
                 }
                 _ => merged.push(c),
             }

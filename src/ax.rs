@@ -806,6 +806,10 @@ impl Node {
 /// The original's transform pipeline for one node, top-down: the node is transformed with its
 /// raw children, then each child in turn. A replacement goes through the whole pipeline again.
 fn transform(mut n: Node) -> Option<Node> {
+    // removeElementsUnderCalendarEvents
+    if n.role_desc.as_deref() == Some("Event") {
+        n.children.clear();
+    }
     // flattenLinksIntoMarkdownText: a link reads as one line, its target as the value.
     if n.role == "AXLink" {
         if n.title.as_deref().unwrap_or("").is_empty() { n.title = n.flattened(|n| &n.title); }
@@ -815,18 +819,24 @@ fn transform(mut n: Node) -> Option<Node> {
     // flattenIntoSelectableAncestor: a selectable row-like element without editable or
     // selectable parts reads as one line; only its checkboxes stay as children.
     if n.selectable && !n.focused && n.role != "AXTable" && n.subrole != "AXTableRow" && !n.any_below(|d| d.value_settable || d.selectable) {
+        // Checkboxes and disclosure triangles stay as children and add no text to the line.
+        fn pull(n: &mut Node, out: &mut Vec<Node>) {
+            for mut c in std::mem::take(&mut n.children) {
+                if c.boolean || c.role == "AXDisclosureTriangle" {
+                    c.children.clear();
+                    out.push(c);
+                } else {
+                    pull(&mut c, out);
+                    n.children.push(c);
+                }
+            }
+        }
+        let mut kept = vec![];
+        pull(&mut n, &mut kept);
         n.title = n.flattened(|n| &n.title);
         n.desc = n.flattened(|n| &n.desc);
         n.value = n.flattened(|n| &n.value);
-        let mut boxes = vec![];
-        let mut stack: Vec<Node> = std::mem::take(&mut n.children).into_iter().rev().collect();
-        while let Some(mut d) = stack.pop() {
-            stack.extend(std::mem::take(&mut d.children).into_iter().rev());
-            if d.boolean {
-                boxes.push(d);
-            }
-        }
-        n.children = boxes;
+        n.children = kept;
     }
     // pruneNonDescriptiveSubtrees
     let reachable = |d: &Node| d.focusable || d.selectable || d.interesting;

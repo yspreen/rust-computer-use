@@ -307,9 +307,22 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App, enforcer: &focus
     // Any action other than opening a menu leaves the recorded one behind.
     record_menu(app.pid, None);
     let index = a["element_index"].as_str().unwrap_or("").trim().to_string();
-    let elem = || -> Result<&Cf, String> {
+    // RefetchableUIElement: an element the app has since invalidated is looked up again by its line.
+    let elem = || -> Result<Cf, String> {
         let i: usize = index.parse().map_err(|_| server_err(format!("{index} is an invalid element ID")))?;
-        snap.tree.elems.get(i).ok_or(server_err(format!("{index} is an invalid element ID")))
+        let e = snap.tree.elems.get(i).ok_or(server_err(format!("{index} is an invalid element ID")))?;
+        if ax::attr(e.0, "AXRole").is_some() {
+            return Ok(Cf(unsafe { core_foundation_sys::base::CFRetain(e.0) }));
+        }
+        let text = |l: &str| l.split_once(' ').map_or(String::new(), |(_, t)| t.to_string());
+        let want = text(&snap.tree.lines[i]);
+        let (tree, _) = render(app)?;
+        let found: Vec<usize> = (0..tree.lines.len()).filter(|&j| text(&tree.lines[j]) == want).collect();
+        match found.as_slice() {
+            [j] => Ok(Cf(unsafe { core_foundation_sys::base::CFRetain(tree.elems[*j].0) })),
+            [] => Err(server_err("The element ID is no longer valid. Try to get the on-screen content again and see if that resolves the issue.")),
+            _ => Err(server_err("The element was invalidated, and an attempt was made to refetch it, but the refetch couldn't be finished because multiple elements were found that match the criteria. Try to get the on-screen content again and see if that resolves the issue.")),
+        }
     };
     let to_screen = |x: f64, y: f64| {
         let (wx, wy, ww, wh) = snap.window;
@@ -355,7 +368,7 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App, enforcer: &focus
             // The cursor glides to the spot first; the click goes out once it is close enough.
             let w = snap.window_id;
             if a.get("element_index").is_some() {
-                let e = elem()?;
+                let e = &elem()?;
                 // The original's menu bar pre-step: make the app believe it is active and record
                 // the item's menu as open instead of pressing it, so nothing shows on screen.
                 if button == "left" && count == 1 && menu_of(e) {
@@ -400,7 +413,7 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App, enforcer: &focus
             cursor::move_to(to, snap.window_id);
         }
         "perform_secondary_action" => {
-            let e = elem()?;
+            let e = &elem()?;
             let want = a["action"].as_str().unwrap_or("");
             let invalid = || server_err(format!("{want} is not a valid secondary action for {index}"));
             // Collapse/Expand are synthesised for outline rows from AXDisclosing.
@@ -424,7 +437,7 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App, enforcer: &focus
             input::type_text(a["text"].as_str().unwrap_or(""));
         }
         "set_value" => {
-            let e = elem()?;
+            let e = &elem()?;
             if !ax::settable(e.0, "AXValue") {
                 return Err(server_err("Cannot set a value for an element that is not settable"));
             }
@@ -444,7 +457,7 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App, enforcer: &focus
             }
         }
         "scroll" => {
-            let e = elem()?;
+            let e = &elem()?;
             let dir = a["direction"].as_str().unwrap_or("down");
             let pages = a["pages"].as_f64().unwrap_or(1.0);
             if pages <= 0.0 {
@@ -465,7 +478,7 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App, enforcer: &focus
             input::scroll(center(e)?, dy, dx);
         }
         "select_text" => {
-            let e = elem()?;
+            let e = &elem()?;
             if !ax::settable(e.0, "AXSelectedTextRange") {
                 return Err(server_err("Cannot select text for an element that does not support a settable selected text range"));
             }

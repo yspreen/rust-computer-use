@@ -742,6 +742,7 @@ impl Node {
         let r = self.role.as_str();
         match (&self.role_desc, r) {
             (_, "AXMenuBarItem" | "AXMenuItem" | "AXRadioGroup") => String::new(),
+            (_, "AXLink") => "link".into(),
             (None, "AXMenu") => "menu".into(),
             (None, "AXMenuBar") => "menu bar".into(),
             (None, _) => "unknown".into(),
@@ -778,7 +779,7 @@ impl Node {
         let candidates = [
             (None, self.title.clone()),
             (Some("Description"), self.desc.clone()),
-            (Some("URL"), self.url.as_deref().map(|u| short_url(u).to_string())),
+            (Some("URL"), self.url.as_deref().filter(|_| self.role != "AXImage").map(|u| short_url(u).to_string())),
             (Some("Help"), self.help.clone()),
             (Some("Value"), self.value.clone()),
             (Some("Details"), self.details.clone()),

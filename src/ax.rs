@@ -569,7 +569,7 @@ fn filled(v: &Option<String>) -> bool {
 
 /// Read an element and (up to `max_depth`) its descendants. None for what the original never
 /// shows: the Apple menu and menu separators.
-fn fetch(e: AXRef, depth: usize, max_depth: usize, budget: &mut usize, web: bool) -> Option<Node> {
+fn fetch(e: AXRef, depth: usize, max_depth: usize, budget: &mut usize, browser: bool) -> Option<Node> {
     *budget = budget.saturating_sub(1);
     let mut vals: CFArrayRef = std::ptr::null();
     ATTR_ARRAY.with(|names| unsafe { AXUIElementCopyMultipleAttributeValues(e, names.0 as _, 0, &mut vals) });
@@ -607,12 +607,12 @@ fn fetch(e: AXRef, depth: usize, max_depth: usize, budget: &mut usize, web: bool
         (_, "AXToggle", Some(v)) if v == "0" || v == "1" => Some(if v == "1" { "on" } else { "off" }.into()),
         (.., v) => v,
     };
-    // Chromium reports a settable AXValue on everything, empty or label text; like the original,
-    // only a real value or a text input counts, and labels never do.
+    // Labels never read as settable; in browsers, where Chromium reports a settable AXValue on
+    // everything, only text inputs and toggles do.
     let text_input = matches!(role.as_str(), "AXTextField" | "AXTextArea");
+    let toggle = value_type == Some("boolean") || role == "AXCheckBox";
     let value_settable =
-        // Inside web content only text inputs read as settable.
-        role != "AXStaticText" && (!web || text_input) && (value.is_some() || text_input && raw(5).is_some()) && settable(e, "AXValue");
+        role != "AXStaticText" && (!browser || text_input || toggle) && raw(5).is_some() && settable(e, "AXValue");
     let (vertical, horizontal) = (raw(17).is_some(), raw(18).is_some());
     let closed_menu = role == "AXMenuBarItem" && depth >= max_depth;
     // The original's filterActions, then only "other" actions are listed: presses, menus and
@@ -666,7 +666,7 @@ fn fetch(e: AXRef, depth: usize, max_depth: usize, budget: &mut usize, web: bool
         if *budget == 0 || depth >= 60 {
             break;
         }
-        children.extend(fetch(c, depth + 1, max_depth, budget, web || role == "AXWebArea"));
+        children.extend(fetch(c, depth + 1, max_depth, budget, browser));
     }
     let id = text(10).filter(|i| !i.starts_with('_') && !i.starts_with("NS"));
     let menu = role.starts_with("AXMenu");
@@ -926,7 +926,10 @@ fn emit(n: Node, depth: usize, tree: &mut Tree) {
 /// `max_depth` levels down.
 pub fn render(root: AXRef, depth: usize, max_depth: usize, tree: &mut Tree) {
     let mut budget = MAX_NODES;
-    if let Some(n) = fetch(root, 0, max_depth, &mut budget, false).and_then(transform) {
+    let browser = pid(root)
+        .and_then(|p| objc2_app_kit::NSRunningApplication::runningApplicationWithProcessIdentifier(p)?.bundleIdentifier())
+        .is_some_and(|b| crate::apps::BROWSERS.contains(&b.to_string().as_str()));
+    if let Some(n) = fetch(root, 0, max_depth, &mut budget, browser).and_then(transform) {
         emit(n, depth, tree);
     }
 }

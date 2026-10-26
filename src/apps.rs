@@ -48,6 +48,16 @@ fn matches(a: &App, q: &str) -> bool {
     a.pid.to_string() == q || a.name.eq_ignore_ascii_case(q) || a.bundle_id.eq_ignore_ascii_case(q) || a.path == q
 }
 
+/// Browsers, which get the original's browser notes and its stricter settable flags.
+pub const BROWSERS: &[&str] = &[
+    "com.google.Chrome", "com.apple.Safari", "com.openai.atlas", "com.openai.atlas.alpha", "com.openai.atlas.beta",
+    "ai.perplexity.comet", "com.brave.Browser", "com.microsoft.edgemac", "com.operasoftware.Opera", "com.vivaldi.Vivaldi",
+    "company.thebrowser.Browser", "company.thebrowser.browser", "company.thebrowser.dia", "net.imput.helium",
+    "org.chromium.Chromium", "app.floorp.Floorp", "app.zen-browser.zen", "io.gitlab.librewolf-community.librewolf",
+    "net.librewolf.librewolf", "net.waterfox.nightly", "net.waterfox.waterfox", "org.mozilla.firefox", "org.mozilla.nightly",
+];
+
+
 /// Terminals and OpenAI's own apps, which the original refuses to drive.
 const BLOCKED: &[&str] = &[
     "com.apple.Terminal", "com.googlecode.iterm2", "dev.warp.Warp-Stable", "net.kovidgoyal.kitty",

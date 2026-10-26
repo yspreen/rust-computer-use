@@ -584,6 +584,25 @@ fn render(app: &apps::App) -> Result<(ax::Tree, Cf), String> {
     Ok((tree, win))
 }
 
+const SPOTIFY_NOTE: &str = "Note: In order to be usable, Spotify app links must be rewritten as regular links (e.g. use open.spotify.com instead of xpui.app.spotify.com). Only use Spotify links that are written verbatim in the UI above. Note that IDs are only valid with their associated type (e.g. you cannot change an \"album\" URL to a \"track\" URL).";
+
+/// The original's per-app notes: one for browsers, and a file per app named after it.
+fn instructions(app: &apps::App) -> Option<&'static str> {
+    if apps::BROWSERS.contains(&app.bundle_id.as_str()) {
+        return Some("## Browser Computer Use\n\nWhen navigating to a new website or starting a separate web task, prefer opening a new tab instead of reusing the current tab; reuse the current tab only when the user explicitly asks to continue there or when the current page is clearly the right place to continue the existing workflow.\n");
+    }
+    Some(match app.bundle_id.as_str() {
+        "com.apple.Music" => include_str!("../instructions/AppleMusic.md"),
+        "com.apple.clock" => include_str!("../instructions/Clock.md"),
+        "notion.id" => include_str!("../instructions/Notion.md"),
+        "com.apple.iWork.Numbers" => include_str!("../instructions/Numbers.md"),
+        "com.tinyspeck.slackmacgap" => include_str!("../instructions/Slack.md"),
+        "com.spotify.client" => include_str!("../instructions/Spotify.md"),
+        "com.apple.ScreenContinuity" => include_str!("../instructions/iPhone Mirroring.md"),
+        _ => return None,
+    })
+}
+
 /// get_app_state gets the full framing; actions get the shorter one.
 fn state(snaps: &mut HashMap<i32, Snapshot>, app: &apps::App, full: bool) -> Result<Value, String> {
     let (tree, win) = render(app)?;
@@ -592,10 +611,12 @@ fn state(snaps: &mut HashMap<i32, Snapshot>, app: &apps::App, full: bool) -> Res
     let window_id = ax::window_id(win.0).or_else(|| window_id(app.pid, frame)).unwrap_or(0);
     // The window server's title first (Chrome's omits the app name), then the AX title.
     let title = window_name(window_id).or_else(|| ax::attr_str(win.0, "AXTitle")).unwrap_or_default();
-    let window = format!("Window: \"{title}\", App: {}.\n{}", app.name, tree.text);
+    let note = if app.bundle_id == "com.spotify.client" { format!("\n{SPOTIFY_NOTE}\n") } else { String::new() };
+    let window = format!("Window: \"{title}\", App: {}.\n{}{note}", app.name, tree.text);
     let body = if full {
+        let tips = instructions(app).map(|t| format!("<app_specific_instructions>\n{t}\n</app_specific_instructions>\n")).unwrap_or_default();
         format!(
-            "Computer Use state (CUA App Version: {CUA_VERSION})\n<app_state>\nApp={}/ (bundleID {}, pid {})\n{window}</app_state>",
+            "Computer Use state (CUA App Version: {CUA_VERSION})\n{tips}<app_state>\nApp={}/ (bundleID {}, pid {})\n{window}</app_state>",
             app.path, app.bundle_id, app.pid
         )
     } else {

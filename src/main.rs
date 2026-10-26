@@ -428,7 +428,20 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App, enforcer: &focus
             if !ax::settable(e.0, "AXValue") {
                 return Err(server_err("Cannot set a value for an element that is not settable"));
             }
+            // focusFieldIfNeeded: focus the field, clicking it when AXFocused does not take.
+            if ax::settable(e.0, "AXFocused") && ax::attr(e.0, "AXFocused").is_some_and(|v| !ax::to_bool(v.0))
+                && (ax::set_bool(e.0, "AXFocused", true).is_err() || !ax::attr(e.0, "AXFocused").is_some_and(|v| ax::to_bool(v.0))) {
+                act(snap, "click", &json!({"element_index": index}), app, enforcer)?;
+            }
             ax::set_attr(e.0, "AXValue", ax::cfstr(a["value"].as_str().unwrap_or("")).0).map_err(server_err)?;
+            // Search fields and address bars are submitted with Return, as the original does.
+            let search = ax::attr_str(e.0, "AXSubrole").as_deref() == Some("AXSearchField")
+                || ax::attr_str(e.0, "AXIdentifier").as_deref() == Some("WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD")
+                || ax::attr_str(e.0, "AXKeyShortcutsValue").as_deref() == Some("⌘L");
+            if search {
+                enforce()?;
+                input::press("Return").map_err(|k| server_err(format!("keyNotFound(\"{k}\")")))?;
+            }
         }
         "scroll" => {
             let e = elem()?;

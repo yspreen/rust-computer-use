@@ -136,6 +136,8 @@ fn serve(input: Box<dyn BufRead + Send>, out: Box<dyn Write + Send>) {
     }
     ax::restore_web();
     srv.enforcers.clear();
+    let recorded: Vec<i32> = MENUS.lock().unwrap().iter().map(|m| m.0).collect();
+    for pid in recorded { record_menu(pid, None); }
 }
 
 /// Tool schemas, worded exactly as the original advertises them.
@@ -277,7 +279,33 @@ fn call(srv: &mut Server, name: &str, a: &Value) -> Result<Value, String> {
         .or_else(|_| Ok(text("Action completed. Call `get_app_state` to fetch the updated UI state.")))
 }
 
+/// The menu the original treats as open per app: a menu bar item it "clicked" without pressing
+/// it (the controller's open-menu box), so the real menu never appears on screen.
+static MENUS: std::sync::Mutex<Vec<(i32, usize)>> = std::sync::Mutex::new(Vec::new());
+
+fn recorded_menu(pid: i32) -> Option<Cf> {
+    MENUS.lock().unwrap().iter().find(|m| m.0 == pid).map(|m| Cf(unsafe { core_foundation_sys::base::CFRetain(m.1 as _) }))
+}
+
+fn record_menu(pid: i32, item: Option<&Cf>) {
+    let mut menus = MENUS.lock().unwrap();
+    if let Some(i) = menus.iter().position(|m| m.0 == pid) {
+        drop(Cf(menus.remove(i).1 as _));
+    }
+    if let Some(item) = item {
+        menus.push((pid, unsafe { core_foundation_sys::base::CFRetain(item.0) } as usize));
+    }
+}
+
+/// openMenu(of:): a menu bar item with an AXMenu child.
+fn menu_of(e: &Cf) -> bool {
+    ax::attr_str(e.0, "AXRole").as_deref() == Some("AXMenuBarItem")
+        && ax::attr(e.0, "AXChildren").is_some_and(|c| ax::elements(&c).iter().any(|&m| ax::attr_str(m, "AXRole").as_deref() == Some("AXMenu")))
+}
+
 fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App, enforcer: &focus::Enforcer) -> Result<(), String> {
+    // Any action other than opening a menu leaves the recorded one behind.
+    record_menu(app.pid, None);
     let index = a["element_index"].as_str().unwrap_or("").trim().to_string();
     let elem = || -> Result<&Cf, String> {
         let i: usize = index.parse().map_err(|_| server_err(format!("{index} is an invalid element ID")))?;
@@ -328,6 +356,13 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App, enforcer: &focus
             let w = snap.window_id;
             if a.get("element_index").is_some() {
                 let e = elem()?;
+                // The original's menu bar pre-step: make the app believe it is active and record
+                // the item's menu as open instead of pressing it, so nothing shows on screen.
+                if button == "left" && count == 1 && menu_of(e) {
+                    enforce()?;
+                    record_menu(app.pid, Some(e));
+                    return Ok(());
+                }
                 // clickablePoint(): the frame center if the clipping ancestors leave it visible.
                 // Chrome can expose an AXActivationPoint outside the element entirely.
                 ax::scroll_to_visible(e.0);
@@ -373,6 +408,11 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App, enforcer: &focus
                 return ax::set_bool(e.0, "AXDisclosing", want == "Expand").map_err(server_err);
             }
             let action = ax::actions(e.0).into_iter().find(|(n, d)| d == want || n == want).ok_or_else(invalid)?;
+            if action.0 == "AXPick" && menu_of(e) {
+                enforce()?;
+                record_menu(app.pid, Some(e));
+                return Ok(());
+            }
             ax::perform(e.0, &action.0).map_err(server_err)?;
         }
         "press_key" => {
@@ -486,7 +526,7 @@ fn render(app: &apps::App) -> Result<(ax::Tree, Cf), String> {
     }
     let mut tree = ax::Tree::default();
     // While a menu is open the original shows only that menu, rooted at its menu bar item.
-    if let Some(menu) = ax::open_menu(root.0) {
+    if let Some(menu) = recorded_menu(app.pid).or_else(|| ax::open_menu(root.0)) {
         ax::render(menu.0, 0, usize::MAX, &mut tree);
         return Ok((tree, win));
     }
@@ -550,7 +590,7 @@ fn state(snaps: &mut HashMap<i32, Snapshot>, app: &apps::App, full: bool) -> Res
     };
     let mut content = vec![json!({"type": "text", "text": body})];
     let mut image = (frame.2, frame.3);
-    let menu_open = ax::open_menu(ax::app_element(app.pid).0).is_some(); // no screenshot then
+    let menu_open = recorded_menu(app.pid).is_some() || ax::open_menu(ax::app_element(app.pid).0).is_some(); // no screenshot then
     match screenshot(window_id) {
         Ok(_) if menu_open => {}
         Ok((jpeg, size)) => {

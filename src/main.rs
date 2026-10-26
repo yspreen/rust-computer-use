@@ -524,7 +524,9 @@ fn settle(pid: i32) {
     }
     LAST.store(0, Relaxed);
     let names = ["AXTitleChanged", "AXLayoutChanged", "AXFocusedWindowChanged", "AXFocusedUIElementChanged", "AXElementBusyChanged",
-        "AXMenuOpened", "AXSheetCreated", "AXWindowCreated", "AXCreated", "AXUIElementDestroyed"];
+        "AXMenuOpened", "AXSheetCreated", "AXWindowCreated", "AXCreated", "AXUIElementDestroyed", "AXMainWindowChanged",
+        "AXRowCountChanged", "AXSelectedRowsChanged", "AXSelectedChildrenChanged", "AXSelectedCellsChanged",
+        "AXSelectedColumnsChanged", "AXSelectedTextChanged", "AXSelectedChildrenMoved"];
     let observer = ax::observe(pid, &names, noted, &start as *const _ as _);
     while since(&start) < 5000 && since(&start).saturating_sub(LAST.load(Relaxed)) < 250 {
         ax::run_loop_for(0.1);

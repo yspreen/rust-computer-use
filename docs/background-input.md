@@ -124,3 +124,11 @@ then about 5 s per function with `Dec.java`). REA CLI evidence for the import:
   centroid of exact hits on a 64x64 grid. Unresolved: the string test in
   `0x1007a9ee0` (first character from a set built at run time, second in
   `1`..`8`, likely a board square name) and `0x10075e4dc`.
+
+## Live check, 2026-10-26
+
+`/tmp/cua-test/scroll.html`: a button 2000 px down inside a 300 px scrolling
+box, in background Chrome. An element click scrolled the box to show it and the
+click landed (counter 0 to 1). The user's app stayed frontmost throughout.
+`open -g` of a file in running Chrome still brings Chrome forward briefly;
+open test pages before the front-app log starts.

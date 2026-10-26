@@ -142,3 +142,4 @@ open test pages before the front-app log starts.
 - Blocklist: terminals and OpenAI's own apps are refused with the original's message.
 - App instructions: the original's AppInstructions/*.md files plus the browser note, and Spotify's link note after the tree.
 - Known difference: while a context menu is open both screenshots are unusable (the original's is blank white at window size; ours shows the menu on a larger canvas).
+- Deliberate difference: for sheets the original captures the sheet's own window, which comes back blank white at sheet size. We keep capturing the parent window so the screenshot shows the sheet over its window.

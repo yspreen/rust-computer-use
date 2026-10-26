@@ -654,11 +654,12 @@ fn fetch(e: AXRef, depth: usize, max_depth: usize, budget: &mut usize, browser: 
     let disclosing = (raw(15).is_some() && settable(e, "AXDisclosing")).then(|| is_true(&text(15)));
     // Disclosable rows offer the toggle (see perform_secondary_action).
     labels.extend(disclosing.map(|on| if on { "Collapse" } else { "Expand" }.to_string()));
-    // Tables under 500 rows list every row; longer ones only the visible rows, noted as a subset.
+    // The original reads at most 100 rows: shorter tables list every row, the rest only the
+    // visible rows, noted as a subset.
     let rows = kids(19);
     let (children_raw, subset) = if depth >= max_depth || rows.is_empty() {
         (children_raw, None)
-    } else if rows.len() < 500 {
+    } else if rows.len() < 100 {
         // Rows, then whatever else the table holds besides rows and columns (its header).
         let rest = children_raw.iter().copied().filter(|&c| !matches!(attr_str(c, "AXRole").as_deref(), Some("AXRow" | "AXColumn")));
         (rows.into_iter().chain(rest).collect(), None)
@@ -673,8 +674,9 @@ fn fetch(e: AXRef, depth: usize, max_depth: usize, budget: &mut usize, browser: 
                 _ => ranges.push((i, i + 1)),
             }
         }
-        // The original counts at most the first 100 rows of a long table.
-        (visible, Some((ranges, rows.len().min(100))))
+        // The count is the 100 rows read, or further if visible rows lie beyond them.
+        let n = ranges.iter().map(|r| r.1).max().unwrap_or(0).max(100);
+        (visible, Some((ranges, n)))
     };
     let focused_raw = raw(13).is_some();
     let mut children = vec![];

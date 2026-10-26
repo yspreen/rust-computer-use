@@ -745,6 +745,7 @@ impl Node {
             (_, "AXLink") => "link".into(),
             (None, "AXMenu") => "menu".into(),
             (None, "AXMenuBar") => "menu bar".into(),
+            (None, "AXGenericElement") => "element".into(),
             (None, _) => "unknown".into(),
             (Some(_), "AXRow") => "row".into(),
             (Some(_), "AXGroup") => "container".into(),

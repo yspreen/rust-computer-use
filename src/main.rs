@@ -561,7 +561,10 @@ fn render(app: &apps::App) -> Result<(ax::Tree, Cf), String> {
     let index_of = |e: *const std::ffi::c_void| {
         tree.elems.iter().position(|x| unsafe { core_foundation_sys::base::CFEqual(x.0, e) } != 0)
     };
-    let focused = ax::attr(root.0, "AXFocusedUIElement");
+    // Focus inside another window (Catalyst keeps it behind a sheet) is not reported.
+    let focused = ax::attr(root.0, "AXFocusedUIElement").filter(|f| {
+        ax::attr(f.0, "AXWindow").is_none_or(|w| unsafe { core_foundation_sys::base::CFEqual(w.0, win.0) } != 0)
+    });
     let selected: Vec<usize> = focused
         .as_ref()
         .and_then(|f| ax::attr(f.0, "AXSelectedRows"))

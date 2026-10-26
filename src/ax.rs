@@ -447,6 +447,9 @@ fn chess_point(e: AXRef) -> Option<(f64, f64)> {
     let p = pid(e)?;
     let bundle = NSRunningApplication::runningApplicationWithProcessIdentifier(p)?.bundleIdentifier()?;
     if attr_str(e, "AXRole").as_deref() != Some("AXButton") || bundle.to_string() != "com.apple.Chess" { return None; }
+    // Original only grid-searches squares whose label ends in a square name like "a1".
+    let sq: Vec<char> = attr_str(e, "AXDescription").unwrap_or_default().chars().rev().take(2).collect();
+    if sq.len() < 2 || !('1'..='8').contains(&sq[0]) || !('a'..='h').contains(&sq[1]) { return None; }
     let (x, y, w, h) = frame(e)?;
     if contains_hit(e, p, crate::input::Pt { x: x + w / 2.0, y: y + h / 2.0 }) { return None; }
     let (mut sx, mut sy, mut n) = (0.0, 0.0, 0.0);

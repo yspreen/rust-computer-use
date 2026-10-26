@@ -556,6 +556,8 @@ struct Node {
     interesting: bool,
     /// Listed row ranges and the row count, when only the visible part of a long table is shown.
     subset: Option<(Vec<(usize, usize)>, usize)>,
+    /// AXServesAsTitleForUIElements of a label.
+    serves: Vec<Cf>,
     children: Vec<Node>,
 }
 
@@ -604,7 +606,7 @@ fn fetch(e: AXRef, depth: usize, max_depth: usize, budget: &mut usize, browser: 
     // Text areas show their styled text as Markdown; toggle buttons read as on/off.
     let value = match (role.as_str(), subrole.as_str(), text(5)) {
         ("AXTextArea", ..) => crate::text::markdown(e).map(|m| m.text).filter(|t| !t.is_empty()),
-        (_, "AXToggle", Some(v)) if v == "0" || v == "1" => Some(if v == "1" { "on" } else { "off" }.into()),
+        (_, "AXToggle" | "AXSwitch", Some(v)) if v == "0" || v == "1" => Some(if v == "1" { "on" } else { "off" }.into()),
         (.., v) => v,
     };
     // Labels never read as settable; in browsers, where Chromium reports a settable AXValue on
@@ -695,6 +697,7 @@ fn fetch(e: AXRef, depth: usize, max_depth: usize, budget: &mut usize, browser: 
         actions: labels,
         interesting,
         subset,
+        serves: if role == "AXStaticText" { attr(e, "AXServesAsTitleForUIElements").map(|a| array(&a).into_iter().map(|x| Cf(unsafe { CFRetain(x) })).collect()).unwrap_or_default() } else { vec![] },
         children,
         role,
     })
@@ -810,6 +813,29 @@ impl Node {
 /// The original's transform pipeline for one node, top-down: the node is transformed with its
 /// raw children, then each child in turn. A replacement goes through the whole pipeline again.
 fn transform(mut n: Node) -> Option<Node> {
+    // associateTitleUIElements: a label titling one sibling becomes that sibling's title; a
+    // label titling several holds them as its children.
+    let mut kids = std::mem::take(&mut n.children);
+    let mut i = 0;
+    while i < kids.len() {
+        let mut served: Vec<usize> = kids[i].serves.iter().filter_map(|s| kids.iter().position(|k| unsafe { CFEqual(k.elem.0, s.0) } != 0)).filter(|&j| j != i).collect();
+        served.sort();
+        if served.len() == 1 && kids[served[0]].title.is_none() {
+            let label = kids.remove(i);
+            let j = if served[0] > i { served[0] - 1 } else { served[0] };
+            kids[j].title = label.value;
+            continue;
+        }
+        if served.len() > 1 {
+            let before = served.iter().filter(|&&j| j < i).count();
+            let mut moved: Vec<Node> = vec![];
+            for j in served.into_iter().rev() { moved.insert(0, kids.remove(j)); }
+            i -= before;
+            kids[i].children.extend(moved);
+        }
+        i += 1;
+    }
+    n.children = kids;
     // removeElementsUnderCalendarEvents
     if n.role_desc.as_deref() == Some("Event") {
         n.children.clear();

@@ -510,6 +510,8 @@ pub struct Tree {
     pub text: String,
     pub elems: Vec<Cf>,
     pub lines: Vec<String>,
+    /// Per index the element's own line, before transforms gave it its descendants' text.
+    pub own_lines: Vec<String>,
 }
 
 
@@ -563,6 +565,8 @@ struct Node {
     subset: Option<(Vec<(usize, usize)>, usize)>,
     /// AXServesAsTitleForUIElements of a label.
     serves: Vec<Cf>,
+    /// description() as fetched.
+    own: String,
     children: Vec<Node>,
 }
 
@@ -682,7 +686,7 @@ fn fetch(e: AXRef, depth: usize, max_depth: usize, budget: &mut usize, browser: 
     }
     let id = text(10).filter(|i| !i.starts_with('_') && !i.starts_with("NS"));
     let menu = role.starts_with("AXMenu");
-    Some(Node {
+    let mut node = Node {
         elem: Cf(unsafe { CFRetain(e) }),
         subrole,
         role_desc: text(2),
@@ -710,7 +714,10 @@ fn fetch(e: AXRef, depth: usize, max_depth: usize, budget: &mut usize, browser: 
         serves: kids(21).into_iter().map(|x| Cf(unsafe { CFRetain(x) })).collect(),
         children,
         role,
-    })
+        own: String::new(),
+    };
+    node.own = node.description();
+    Some(node)
 }
 
 impl Node {
@@ -957,6 +964,7 @@ fn emit(n: Node, depth: usize, tree: &mut Tree) {
         tree.text += &format!("{}{i} {line}\n", "\t".repeat(depth));
         // Selection and focus notes quote the line without the subset note.
         tree.lines.push(format!("{i} {}", n.description()));
+        tree.own_lines.push(format!("{i} {}", n.own));
         tree.elems.push(n.elem);
         depth + 1
     };

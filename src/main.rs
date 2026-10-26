@@ -584,15 +584,12 @@ fn render(app: &apps::App) -> Result<(ax::Tree, Cf), String> {
     });
     let selected: Vec<usize> = focused
         .as_ref()
-        .and_then(|f| ax::attr(f.0, "AXSelectedRows"))
+        .and_then(|f| ax::attr(f.0, "AXSelectedRows").or_else(|| ax::attr(f.0, "AXSelectedChildren")))
         .map(|rows| ax::elements(&rows).into_iter().filter_map(index_of).collect())
         .unwrap_or_default();
     if !selected.is_empty() {
-        // Only the index, role and flags: the row's text is already in the tree above.
-        let heads: Vec<String> = selected.iter().map(|&i| {
-            let l = &tree.lines[i];
-            l.find(") ").map_or(l.clone(), |p| l[..=p].to_string())
-        }).collect();
+        // Each element's own line, without the text its descendants lent it.
+        let heads: Vec<String> = selected.iter().map(|&i| tree.own_lines[i].clone()).collect();
         tree.text += &format!("\nSelected:\n\t{}\n\n{SELECTION_NOTE}\n", heads.join("\n\t"));
     } else if let Some(t) = focused.as_ref().and_then(|f| ax::attr_str(f.0, "AXSelectedText")) {
         tree.text += &format!("\nSelected text: ```\n{t}\n```\n\n{SELECTION_NOTE}\n");
@@ -630,7 +627,10 @@ fn state(snaps: &mut HashMap<i32, Snapshot>, app: &apps::App, full: bool) -> Res
     // The AX window's own number; a frame match alone can pick a same-sized popup (Chrome's omnibox).
     let window_id = ax::window_id(win.0).or_else(|| window_id(app.pid, frame)).unwrap_or(0);
     // The window server's title first (Chrome's omits the app name), then the AX title.
-    let title = window_name(window_id).or_else(|| ax::attr_str(win.0, "AXTitle")).unwrap_or_default();
+    let title = window_name(window_id).or_else(|| ax::attr_str(win.0, "AXTitle"))
+        // Finder's desktop is a scroll area, not a window; the original calls it "Desktop".
+        .or_else(|| (ax::attr_str(win.0, "AXRole").as_deref() == Some("AXScrollArea")).then(|| "Desktop".into()))
+        .unwrap_or_default();
     let note = if app.bundle_id == "com.spotify.client" { format!("\n{SPOTIFY_NOTE}\n") } else { String::new() };
     let window = format!("Window: \"{title}\", App: {}.\n{}{note}", app.name, tree.text);
     let body = if full {
@@ -678,7 +678,7 @@ pub fn window_list() -> Vec<(u32, i32, i64)> {
 /// The app's normal (layer 0) windows as (window number, CG bounds x, y, w, h).
 /// `on_screen` leaves out hidden windows and other Spaces.
 pub fn windows(pid: i32, on_screen: bool) -> Vec<(u32, (f64, f64, f64, f64))> {
-    let list = Cf(unsafe { CGWindowListCopyWindowInfo(if on_screen { 1 | 16 } else { 16 }, 0) } as _);
+    let list = Cf(unsafe { CGWindowListCopyWindowInfo(if on_screen { 1 | 16 } else { 0 }, 0) } as _);
     let num = |d: *const std::ffi::c_void, k: &str| {
         let v = unsafe { CFDictionaryGetValue(d as _, ax::cfstr(k).0) };
         let mut f = f64::NAN;
@@ -689,7 +689,7 @@ pub fn windows(pid: i32, on_screen: bool) -> Vec<(u32, (f64, f64, f64, f64))> {
     };
     (0..unsafe { CFArrayGetCount(list.0 as _) })
         .map(|i| unsafe { CFArrayGetValueAtIndex(list.0 as _, i) })
-        .filter(|&d| num(d, "kCGWindowOwnerPID") as i32 == pid && num(d, "kCGWindowLayer") == 0.0)
+        .filter(|&d| num(d, "kCGWindowOwnerPID") as i32 == pid && (num(d, "kCGWindowLayer") == 0.0 || !on_screen))
         .map(|d| {
             let b = unsafe { CFDictionaryGetValue(d as _, ax::cfstr("kCGWindowBounds").0) };
             let bounds = (num(b, "X"), num(b, "Y"), num(b, "Width"), num(b, "Height"));
@@ -722,7 +722,7 @@ fn window_name(id: u32) -> Option<String> {
 }
 
 /// CGWindowID of the app's window closest to the AX window frame. All windows count, so
-/// hidden apps and other Spaces still capture.
+/// hidden apps and other Spaces still capture, and so does Finder's desktop (below layer 0).
 fn window_id(pid: i32, frame: (f64, f64, f64, f64)) -> Option<u32> {
     let dist = |(x, y, w, h): (f64, f64, f64, f64)| ((x - frame.0).abs() + (y - frame.1).abs() + (w - frame.2).abs() + (h - frame.3).abs()) as i64;
     windows(pid, false).into_iter().min_by_key(|w| dist(w.1)).map(|w| w.0)

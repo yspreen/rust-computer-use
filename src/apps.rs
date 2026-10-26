@@ -48,6 +48,15 @@ fn matches(a: &App, q: &str) -> bool {
     a.pid.to_string() == q || a.name.eq_ignore_ascii_case(q) || a.bundle_id.eq_ignore_ascii_case(q) || a.path == q
 }
 
+/// Terminals and OpenAI's own apps, which the original refuses to drive.
+const BLOCKED: &[&str] = &[
+    "com.apple.Terminal", "com.googlecode.iterm2", "dev.warp.Warp-Stable", "net.kovidgoyal.kitty",
+    "com.github.wez.wezterm", "com.mitchellh.ghostty", "com.raphaelamorim.rio", "dev.commandline.waveterm",
+    "com.openai.codex", "com.openai.codex.alpha", "com.openai.codex.beta", "com.openai.codex.dev",
+    "com.openai.codex.nightly", "com.openai.chat.alpha", "com.openai.chat.beta", "com.openai.chat.nightly",
+    "com.openai.chat.mac-debug",
+];
+
 /// Bundle path for an app that is not running, without launching it.
 fn locate(q: &str) -> Option<String> {
     let ws = NSWorkspace::sharedWorkspace();
@@ -67,6 +76,12 @@ pub fn resolve(q: &str) -> Result<App, String> {
         Some(a) => a.path.clone(),
         None => locate(q).ok_or(format!("Invalid app: {q}"))?,
     };
+    let id = found.as_ref().map(|a| a.bundle_id.clone()).or_else(|| {
+        NSBundle::bundleWithPath(&NSString::from_str(&path)).and_then(|b| b.bundleIdentifier()).map(|s| s.to_string())
+    });
+    if let Some(id) = id.filter(|id| BLOCKED.contains(&id.as_str())) {
+        return Err(format!("Computer Use is not allowed to use the app '{id}' for safety reasons."));
+    }
     if let Some(a) = found {
         return Ok(a);
     }

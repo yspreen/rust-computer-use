@@ -143,3 +143,5 @@ open test pages before the front-app log starts.
 - App instructions: the original's AppInstructions/*.md files plus the browser note, and Spotify's link note after the tree.
 - Known difference: while a context menu is open both screenshots are unusable (the original's is blank white at window size; ours shows the menu on a larger canvas).
 - Deliberate difference: for sheets the original captures the sheet's own window, which comes back blank white at sheet size. We keep capturing the parent window so the screenshot shows the sheet over its window.
+- Electron apps get the browser settable rule (only text inputs and boolean toggles); links keep nested links; every field is cut at 512 characters. Verified against the original on Cursor.
+- Testing note: shells spawned from Electron hosts inherit ELECTRON_RUN_AS_NODE=1, which makes `open -a Cursor` exit at once. Launch with `env -u ELECTRON_RUN_AS_NODE`.

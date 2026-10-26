@@ -610,7 +610,7 @@ fn fetch(e: AXRef, depth: usize, max_depth: usize, budget: &mut usize, browser: 
     // Labels never read as settable; in browsers, where Chromium reports a settable AXValue on
     // everything, only text inputs and toggles do.
     let text_input = matches!(role.as_str(), "AXTextField" | "AXTextArea");
-    let toggle = value_type == Some("boolean") || role == "AXCheckBox";
+    let toggle = value_type == Some("boolean");
     let value_settable =
         role != "AXStaticText" && (!browser || text_input || toggle) && raw(5).is_some() && settable(e, "AXValue");
     let (vertical, horizontal) = (raw(17).is_some(), raw(18).is_some());
@@ -793,6 +793,8 @@ impl Node {
         let mut fields: Vec<(Option<&str>, String)> = candidates
             .into_iter()
             .filter_map(|(k, v)| v.filter(|v| !v.is_empty() && seen.insert(v.clone())).map(|v| (k, v)))
+            // The original cuts each field at 512 characters.
+            .map(|(k, v)| (k, v.chars().take(512).collect::<String>()))
             .collect();
         // Long or multi-line fields go last so the short ones stay readable.
         fields.sort_by_key(|(_, v)| v.chars().count() > 100 || v.contains('\n'));
@@ -816,7 +818,7 @@ fn transform(mut n: Node) -> Option<Node> {
     if n.role == "AXLink" {
         if n.title.as_deref().unwrap_or("").is_empty() { n.title = n.flattened(|n| &n.title); }
         if n.value.is_none() { n.value = n.url.take().map(|u| short_url(&u).to_string()); }
-        n.children.clear();
+        n.children.retain(|c| c.role == "AXLink"); // nested links stay, the rest is the link's text
     }
     // flattenIntoSelectableAncestor: a selectable row-like element without editable or
     // selectable parts reads as one line; only its checkboxes stay as children.
@@ -930,7 +932,9 @@ pub fn render(root: AXRef, depth: usize, max_depth: usize, tree: &mut Tree) {
     let mut budget = MAX_NODES;
     let browser = pid(root)
         .and_then(|p| objc2_app_kit::NSRunningApplication::runningApplicationWithProcessIdentifier(p)?.bundleIdentifier())
-        .is_some_and(|b| crate::apps::BROWSERS.contains(&b.to_string().as_str()));
+        .is_some_and(|b| crate::apps::BROWSERS.contains(&b.to_string().as_str()))
+        || pid(root).and_then(|p| objc2_app_kit::NSRunningApplication::runningApplicationWithProcessIdentifier(p)?.bundleURL()?.path())
+            .is_some_and(|p| std::path::Path::new(&format!("{p}/Contents/Frameworks/Electron Framework.framework")).exists());
     if let Some(n) = fetch(root, 0, max_depth, &mut budget, browser).and_then(transform) {
         emit(n, depth, tree);
     }

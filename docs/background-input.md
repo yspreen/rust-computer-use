@@ -132,3 +132,13 @@ box, in background Chrome. An element click scrolled the box to show it and the
 click landed (counter 0 to 1). The user's app stayed frontmost throughout.
 `open -g` of a file in running Chrome still brings Chrome forward briefly;
 open test pages before the front-app log starts.
+
+## Parity sweep, part 2
+
+- Chess grid search only runs for buttons whose label ends in a square name ("a1"–"h8").
+- Tree transforms added: links flatten to one line with the target as Value (`flattenLinksIntoMarkdownText`), events in Calendar lose their children (`removeElementsUnderCalendarEvents`), and flattened rows keep checkboxes and disclosure triangles as children without adding their values to the row text.
+- Settable flags: in browsers only text inputs and toggles show "(settable)"; elsewhere any settable AXValue does, including empty ones (Spotify's groups).
+- Image URLs are not printed; AXLink always reads "link".
+- Blocklist: terminals and OpenAI's own apps are refused with the original's message.
+- App instructions: the original's AppInstructions/*.md files plus the browser note, and Spotify's link note after the tree.
+- Known difference: while a context menu is open both screenshots are unusable (the original's is blank white at window size; ours shows the menu on a larger canvas).

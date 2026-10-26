@@ -151,6 +151,10 @@ pub fn to_string(v: CFTypeRef) -> Option<String> {
             if f.fract() == 0.0 {
                 return Some(format!("{}", f as i64));
             }
+            // Single-precision numbers read in their shortest single-precision form.
+            if CFNumberGetType(v as _) == kCFNumberFloat32Type {
+                return Some(format!("{}", f as f32));
+            }
             // 16 significant digits, like %.16g.
             let decimals = (15 - f.abs().log10().floor() as i32).max(0) as usize;
             Some(
@@ -510,10 +514,11 @@ pub struct Tree {
 
 
 /// Attributes read for every element, in one round trip.
-const ATTRS: [&str; 21] = [
+const ATTRS: [&str; 22] = [
     "AXRole", "AXSubrole", "AXRoleDescription", "AXTitle", "AXDescription", "AXValue", "AXPlaceholderValue",
     "AXHelp", "AXURL", "AXDocument", "AXIdentifier", "AXValueDescription", "AXSelected", "AXFocused", "AXEnabled",
     "AXDisclosing", "AXChildren", "AXVerticalScrollBar", "AXHorizontalScrollBar", "AXRows", "AXVisibleRows",
+    "AXServesAsTitleForUIElements",
 ];
 
 thread_local! {
@@ -639,6 +644,9 @@ fn fetch(e: AXRef, depth: usize, max_depth: usize, budget: &mut usize, browser: 
         .filter(|(n, _)| !matches!(n.as_str(), "AXPress" | "AXShowMenu" | "AXScrollToVisible"))
         .map(|(_, l)| l)
         .collect();
+    // Repeated actions are listed once.
+    let mut seen = std::collections::HashSet::new();
+    labels.retain(|l| seen.insert(l.clone()));
     let disclosing = (raw(15).is_some() && settable(e, "AXDisclosing")).then(|| is_true(&text(15)));
     // Disclosable rows offer the toggle (see perform_secondary_action).
     labels.extend(disclosing.map(|on| if on { "Collapse" } else { "Expand" }.to_string()));
@@ -697,7 +705,7 @@ fn fetch(e: AXRef, depth: usize, max_depth: usize, budget: &mut usize, browser: 
         actions: labels,
         interesting,
         subset,
-        serves: if role == "AXStaticText" { attr(e, "AXServesAsTitleForUIElements").map(|a| array(&a).into_iter().map(|x| Cf(unsafe { CFRetain(x) })).collect()).unwrap_or_default() } else { vec![] },
+        serves: kids(21).into_iter().map(|x| Cf(unsafe { CFRetain(x) })).collect(),
         children,
         role,
     })
@@ -818,12 +826,14 @@ fn transform(mut n: Node) -> Option<Node> {
     let mut kids = std::mem::take(&mut n.children);
     let mut i = 0;
     while i < kids.len() {
-        let mut served: Vec<usize> = kids[i].serves.iter().filter_map(|s| kids.iter().position(|k| unsafe { CFEqual(k.elem.0, s.0) } != 0)).filter(|&j| j != i).collect();
+        // Only when every titled element is a sibling; a later label overrides an earlier one.
+        let found: Vec<Option<usize>> = kids[i].serves.iter().map(|s| kids.iter().position(|k| unsafe { CFEqual(k.elem.0, s.0) } != 0).filter(|&j| j != i)).collect();
+        let mut served: Vec<usize> = if found.iter().all(Option::is_some) { found.into_iter().flatten().collect() } else { vec![] };
         served.sort();
-        if served.len() == 1 && kids[served[0]].title.is_none() {
+        if served.len() == 1 {
             let label = kids.remove(i);
             let j = if served[0] > i { served[0] - 1 } else { served[0] };
-            kids[j].title = label.value;
+            kids[j].title = label.value.or(label.title).or(label.desc);
             continue;
         }
         if served.len() > 1 {

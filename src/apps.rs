@@ -97,6 +97,7 @@ pub fn resolve(q: &str) -> Result<App, String> {
     }
     // An Electron host (Claude Code, T3 Code) leaks ELECTRON_RUN_AS_NODE, which `open` passes on
     // and which turns any Electron app into a bare node that exits at once.
+    let before = NSWorkspace::sharedWorkspace().frontmostApplication();
     let ok = Command::new("/usr/bin/open")
         .args(["-g", "-a", &path])
         .env_remove("ELECTRON_RUN_AS_NODE")
@@ -109,6 +110,16 @@ pub fn resolve(q: &str) -> Result<App, String> {
             let root = crate::ax::app_element(a.pid);
             for _ in 0..50 {
                 if crate::ax::window(root.0).is_some() {
+                    // Electron apps activate themselves as their first window shows, whatever
+                    // the launch asked for; hand the front back for as long as they keep trying.
+                    let start = std::time::Instant::now();
+                    while start.elapsed() < std::time::Duration::from_secs(3) {
+                        if frontmost() == Some(a.pid) {
+                            #[allow(deprecated)]
+                            before.as_ref().map(|b| b.activateWithOptions(objc2_app_kit::NSApplicationActivationOptions(0)));
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
                     return Ok(a);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));

@@ -473,9 +473,10 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App, enforcer: &focus
                 "left" => (0, -px(w)),
                 _ => (0, px(w)),
             };
-            cursor::move_to(center(e)?, snap.window_id);
+            let at = ax::visible_center(e.0).map(|(x, y)| Pt { x, y }).map_or_else(|| center(e), Ok)?;
+            cursor::move_to(at, snap.window_id);
             input::set_mouse_flags(0);
-            input::scroll(center(e)?, dy, dx);
+            input::scroll(at, dy, dx);
         }
         "select_text" => {
             let e = &elem()?;

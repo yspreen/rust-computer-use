@@ -335,7 +335,23 @@ pub fn clickable_point(e: AXRef) -> Option<(f64, f64)> {
     if let Some(p) = chess_point(e) { return Some(p); }
     let (x, y, w, h) = frame(e)?;
     let mid = (x + w / 2.0, y + h / 2.0);
-    let mut vis = (f64::NEG_INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::INFINITY); // x0, y0, x1, y1
+    let vis = clip(e)?;
+    (mid.0 >= vis.0 && mid.0 < vis.2 && mid.1 >= vis.1 && mid.1 < vis.3).then_some(mid)
+}
+
+/// Middle of the part of the element its clipping ancestors leave visible (a tall table's
+/// frame reaches far past its scroll area).
+pub fn visible_center(e: AXRef) -> Option<(f64, f64)> {
+    let (x, y, w, h) = frame(e)?;
+    let v = clip(e)?;
+    let (x0, y0, x1, y1) = (x.max(v.0), y.max(v.1), (x + w).min(v.2), (y + h).min(v.3));
+    (x0 < x1 && y0 < y1).then(|| ((x0 + x1) / 2.0, (y0 + y1) / 2.0))
+}
+
+/// The visible rect (x0, y0, x1, y1) the element's clipping ancestors (scroll areas, groups
+/// with a scroll action, and the enclosing window, sheet, menu or popover) allow.
+fn clip(e: AXRef) -> Option<(f64, f64, f64, f64)> {
+    let mut vis = (f64::NEG_INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::INFINITY);
     let mut cur = Some(Cf(unsafe { CFRetain(e) }));
     while let Some(c) = cur {
         let role = attr_str(c.0, "AXRole");
@@ -353,7 +369,7 @@ pub fn clickable_point(e: AXRef) -> Option<(f64, f64)> {
         if top { break; }
         cur = attr(c.0, "AXParent");
     }
-    (mid.0 >= vis.0 && mid.0 < vis.2 && mid.1 >= vis.1 && mid.1 < vis.3).then_some(mid)
+    Some(vis)
 }
 
 type Rect = (f64, f64, f64, f64);

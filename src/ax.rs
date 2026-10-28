@@ -7,6 +7,9 @@ use std::ffi::c_void;
 
 pub type AXRef = *const c_void;
 const MAX_NODES: usize = 12000;
+/// A hung app (a stalled WebKit content process) answers each request only after the
+/// system's AX timeout; stop reading new elements once a render has taken this long.
+const MAX_RENDER: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Display names for standard actions; anything else shows its AX description.
 const STANDARD_ACTIONS: &[(&str, &str)] = &[
@@ -540,6 +543,7 @@ const ATTRS: [&str; 24] = [
 ];
 
 thread_local! {
+    static RENDER_START: std::cell::Cell<std::time::Instant> = std::cell::Cell::new(std::time::Instant::now());
     static ATTR_ARRAY: Cf = {
         let names: Vec<Cf> = ATTRS.iter().map(|a| cfstr(a)).collect();
         let ptrs: Vec<CFTypeRef> = names.iter().map(|n| n.0).collect();
@@ -690,7 +694,13 @@ fn fetch(e: AXRef, depth: usize, max_depth: usize, budget: &mut usize, browser: 
         (children_raw, None)
     } else if rows.len() < 100 {
         // Rows, then whatever else the table holds besides rows and columns (its header).
-        let rest = children_raw.iter().copied().filter(|&c| !matches!(attr_str(c, "AXRole").as_deref(), Some("AXRow" | "AXColumn")));
+        // Columns repeat the rows, and so does a web table's header group of cells.
+        let cells_only = |c: AXRef| {
+            let kids = attr(c, "AXChildren").map(|k| elements(&k)).unwrap_or_default();
+            !kids.is_empty() && kids.iter().all(|&k| attr_str(k, "AXRole").as_deref() == Some("AXCell"))
+        };
+        let rest = children_raw.iter().copied()
+            .filter(|&c| !matches!(attr_str(c, "AXRole").as_deref(), Some("AXRow" | "AXColumn")) && !cells_only(c));
         (rows.into_iter().chain(rest).collect(), None)
     } else {
         let visible = kids(20);
@@ -710,7 +720,7 @@ fn fetch(e: AXRef, depth: usize, max_depth: usize, budget: &mut usize, browser: 
     let focused_raw = raw(13).is_some();
     let mut children = vec![];
     for &c in &children_raw {
-        if *budget == 0 || depth >= 60 {
+        if *budget == 0 || depth >= 60 || RENDER_START.with(|t| t.get().elapsed() > MAX_RENDER) {
             break;
         }
         children.extend(fetch(c, depth + 1, max_depth, budget, browser));
@@ -988,9 +998,10 @@ fn transform(mut n: Node) -> Option<Node> {
     Some(n)
 }
 
-/// The original's URL budget: when the printed URLs add up to more than 4000 characters, each
-/// loses its query and keeps at most 20 characters, children before their parent, and once
-/// the budget is spent the rest read "…".
+/// The original's URL budget (UIElementURLShortener): while the printed URLs add up to more
+/// than 4000 characters it drops fragments, then queries, then caps each URL at 120, 110, ...
+/// down to 20 characters. URLs are counted children before their parent, and any that would
+/// still pass the total read "…".
 fn shorten_urls(n: &mut Node) {
     fn collect<'a>(n: &'a mut Node, out: &mut Vec<&'a mut String>) {
         for c in &mut n.children {
@@ -1006,17 +1017,29 @@ fn shorten_urls(n: &mut Node) {
             out.extend(n.value.as_mut());
         }
     }
+    fn trim(u: &str, fragment: bool, query: bool, limit: usize) -> String {
+        let u = if fragment { u } else { u.split('#').next().unwrap_or_default() };
+        let u = if query { u } else { u.split('?').next().unwrap_or_default() };
+        if u.chars().count() > limit { u.chars().take(limit - 1).chain(['…']).collect() } else { u.to_string() }
+    }
     let mut urls = vec![];
     collect(n, &mut urls);
-    if urls.iter().map(|u| u.chars().count()).sum::<usize>() <= 4000 {
+    let steps = [(true, true, usize::MAX), (false, true, usize::MAX)].into_iter()
+        .chain((2..=12).rev().map(|k| (false, false, k * 10)));
+    let total = |c: (bool, bool, usize)| urls.iter().map(|u| trim(u, c.0, c.1, c.2).chars().count()).sum::<usize>();
+    let mut config = (true, true, usize::MAX);
+    for c in steps {
+        config = c;
+        if total(c) <= 4000 {
+            break;
+        }
+    }
+    if config == (true, true, usize::MAX) {
         return;
     }
     let mut used = 0;
     for u in urls {
-        let mut s: String = u.split('?').next().unwrap_or_default().to_string();
-        if s.chars().count() > 20 {
-            s = s.chars().take(19).chain(['…']).collect();
-        }
+        let mut s = trim(u, config.0, config.1, config.2);
         if used + s.chars().count() > 4000 {
             s = "…".into();
         }
@@ -1051,6 +1074,7 @@ fn emit(n: Node, depth: usize, tree: &mut Tree) {
 /// `max_depth` levels down.
 pub fn render(root: AXRef, depth: usize, max_depth: usize, tree: &mut Tree) {
     let mut budget = MAX_NODES;
+    RENDER_START.with(|t| t.set(std::time::Instant::now()));
     let browser = pid(root)
         .and_then(|p| objc2_app_kit::NSRunningApplication::runningApplicationWithProcessIdentifier(p)?.bundleIdentifier())
         .is_some_and(|b| crate::apps::BROWSERS.contains(&b.to_string().as_str()))

@@ -628,6 +628,13 @@ fn fetch(e: AXRef, depth: usize, max_depth: usize, budget: &mut usize, browser: 
         return None;
     }
     let children_raw = if depth < max_depth { kids(16) } else { vec![] };
+    // Like rows, 100 or more children are read only as far as they are visible (a grid of
+    // cells), in the order the element lists them as visible.
+    let visible = (children_raw.len() >= 100).then(|| attr(e, "AXVisibleChildren")).flatten();
+    let children_raw = match visible.as_ref().map(elements) {
+        Some(v) if !v.is_empty() => v, // borrowed from `visible`, which lives to the end
+        _ => children_raw,
+    };
     if role == "AXMenuItem" && title.is_none() && children_raw.is_empty() {
         return None;
     }

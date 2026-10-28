@@ -557,6 +557,7 @@ fn render(app: &apps::App) -> Result<(ax::Tree, Cf), String> {
     // While a menu is open the original shows only that menu, rooted at its menu bar item.
     if let Some(menu) = recorded_menu(app.pid).or_else(|| ax::open_menu(root.0)) {
         ax::render(menu.0, 0, usize::MAX, &mut tree);
+        tree.text += "\n";
         return Ok((tree, win));
     }
     ax::render(win.0, 0, usize::MAX, &mut tree);
@@ -641,7 +642,8 @@ fn state(snaps: &mut HashMap<i32, Snapshot>, app: &apps::App, full: bool) -> Res
             app.path, app.bundle_id, app.pid
         )
     } else {
-        format!("App={} (pid {})\n{window}", app.bundle_id, app.pid)
+        // Actions drop the tree's final newline.
+        format!("App={} (pid {})\n{}", app.bundle_id, app.pid, window.strip_suffix('\n').unwrap_or(&window))
     };
     let mut content = vec![json!({"type": "text", "text": body})];
     let mut image = (frame.2, frame.3);

@@ -99,10 +99,19 @@ pub fn resolve(q: &str) -> Result<App, String> {
     for _ in 0..50 {
         std::thread::sleep(std::time::Duration::from_millis(100));
         if let Some(a) = running().into_iter().find(|a| ok && a.path == path) {
-            return Ok(a);
+            // The original waits for the app it launched to show a window.
+            let root = crate::ax::app_element(a.pid);
+            for _ in 0..50 {
+                if crate::ax::window(root.0).is_some() {
+                    return Ok(a);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            break;
         }
     }
-    Err(format!("Invalid app: {q}"))
+    // Found but never came up (an Electron app that quits at once): the original times out.
+    Err("Computer Use server error -10005: timeoutReached".into())
 }
 
 /// Menu-bar apps declare a boolean `LSUIElement`; the original skips them. (A string "1" does

@@ -717,9 +717,9 @@ fn fetch(e: AXRef, depth: usize, max_depth: usize, budget: &mut usize, browser: 
         url: text(8).or_else(|| text(9)),
         id,
         details: text(11),
-        // Menus track selection for highlighting only; the original never shows it.
+        // A menu's items are never called selectable, only the highlighted one selected.
         selectable: !menu && raw(12).is_some() && settable(e, "AXSelected"),
-        selected: !menu && is_true(&text(12)),
+        selected: is_true(&text(12)),
         focusable: focused_raw && settable(e, "AXFocused"),
         focused: is_true(&text(13)),
         enabled: !matches!(text(14).as_deref(), Some("off" | "0")),

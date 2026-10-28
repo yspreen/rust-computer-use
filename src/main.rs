@@ -560,6 +560,13 @@ fn render(app: &apps::App) -> Result<(ax::Tree, Cf), String> {
         tree.text += "\n";
         return Ok((tree, win));
     }
+    // An app's first accessibility pass settles its tree (SwiftUI moves focus into its content
+    // as it is read); the original's first read already sees the settled tree.
+    static WARMED: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+    if !WARMED.lock().unwrap().contains(&app.pid) {
+        WARMED.lock().unwrap().push(app.pid);
+        ax::render(win.0, 0, usize::MAX, &mut ax::Tree::default());
+    }
     ax::render(win.0, 0, usize::MAX, &mut tree);
     // Chromium and Firefox build their web trees lazily (first request, or after dropping it
     // in the background): give it up to 3 s to show page content, and a nearly empty window too.

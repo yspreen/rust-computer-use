@@ -532,11 +532,11 @@ pub struct Tree {
 
 
 /// Attributes read for every element, in one round trip.
-const ATTRS: [&str; 22] = [
+const ATTRS: [&str; 24] = [
     "AXRole", "AXSubrole", "AXRoleDescription", "AXTitle", "AXDescription", "AXValue", "AXPlaceholderValue",
     "AXHelp", "AXURL", "AXDocument", "AXIdentifier", "AXValueDescription", "AXSelected", "AXFocused", "AXEnabled",
     "AXDisclosing", "AXChildren", "AXVerticalScrollBar", "AXHorizontalScrollBar", "AXRows", "AXVisibleRows",
-    "AXServesAsTitleForUIElements",
+    "AXServesAsTitleForUIElements", "AXRowIndexRange", "AXColumnIndexRange",
 ];
 
 thread_local! {
@@ -561,6 +561,13 @@ struct Node {
     placeholder: Option<String>,
     help: Option<String>,
     url: Option<String>,
+    /// The value is the link's target, so it counts against the URL budget.
+    value_is_url: bool,
+    /// Rows and columns a cell spans, when more than one.
+    rows: Option<String>,
+    cols: Option<String>,
+    /// Read from a browser or Electron app, where the original cuts fields at 512 characters.
+    browser: bool,
     id: Option<String>,
     details: Option<String>,
     selectable: bool,
@@ -606,6 +613,11 @@ fn fetch(e: AXRef, depth: usize, max_depth: usize, budget: &mut usize, browser: 
     let raw = |i: usize| got.get(i).copied().filter(|v| !v.is_null() && unsafe { CFGetTypeID(*v) != AXValueGetTypeID() });
     let text = |i: usize| raw(i).and_then(to_string).filter(|s| !s.is_empty());
     let kids = |i: usize| raw(i).map(|v| array(&Cf(unsafe { CFRetain(v) }))).unwrap_or_default();
+    let span = |i: usize| {
+        let mut r = [0isize; 2];
+        got.get(i).filter(|v| !v.is_null() && unsafe { AXValueGetValue(**v, 4, r.as_mut_ptr() as _) })?;
+        (r[1] > 1).then(|| format!("{}-{}", r[0], r[0] + r[1] - 1))
+    };
     let role = text(0).unwrap_or_default();
     let title = text(3);
     if role == "AXMenuBarItem" && title.as_deref() == Some("Apple") {
@@ -716,6 +728,10 @@ fn fetch(e: AXRef, depth: usize, max_depth: usize, budget: &mut usize, browser: 
         placeholder: text(6),
         help: text(7),
         url: text(8).or_else(|| text(9)),
+        value_is_url: false,
+        rows: span(22),
+        cols: span(23),
+        browser,
         id,
         details: text(11),
         // A menu's items are never called selectable, only the highlighted one selected.
@@ -817,6 +833,8 @@ impl Node {
         .filter_map(|(on, f)| on.then_some(f))
         .collect();
         let candidates = [
+            (Some("Rows"), self.rows.clone()),
+            (Some("Columns"), self.cols.clone()),
             (None, self.title.clone()),
             (Some("Description"), self.desc.clone()),
             (Some("URL"), self.url.as_deref().filter(|_| self.role != "AXImage").map(|u| short_url(u).to_string())),
@@ -832,8 +850,8 @@ impl Node {
         let mut fields: Vec<(Option<&str>, String)> = candidates
             .into_iter()
             .filter_map(|(k, v)| v.filter(|v| !v.is_empty() && seen.insert(v.clone())).map(|v| (k, v)))
-            // The original cuts each field at 512 characters.
-            .map(|(k, v)| (k, v.chars().take(512).collect::<String>()))
+            // In browsers and Electron apps the original cuts each field at 512 characters.
+            .map(|(k, v)| (k, if self.browser { v.chars().take(512).collect::<String>() } else { v }))
             .collect();
         // Long or multi-line fields go last so the short ones stay readable.
         fields.sort_by_key(|(_, v)| v.chars().count() > 100 || v.contains('\n'));
@@ -881,7 +899,7 @@ fn transform(mut n: Node) -> Option<Node> {
     // flattenLinksIntoMarkdownText: a link reads as one line, its target as the value.
     if n.role == "AXLink" {
         if n.title.as_deref().unwrap_or("").is_empty() { n.title = n.flattened(|n| &n.title); }
-        if n.value.is_none() { n.value = n.url.take().map(|u| short_url(&u).to_string()); }
+        if n.value.is_none() { n.value = n.url.take().map(|u| short_url(&u).to_string()); n.value_is_url = n.value.is_some(); }
         n.children.retain(|c| c.role == "AXLink"); // nested links stay, the rest is the link's text
     }
     // flattenIntoSelectableAncestor: a selectable row-like element without editable or
@@ -970,6 +988,43 @@ fn transform(mut n: Node) -> Option<Node> {
     Some(n)
 }
 
+/// The original's URL budget: when the printed URLs add up to more than 4000 characters, each
+/// loses its query and keeps at most 20 characters, children before their parent, and once
+/// the budget is spent the rest read "…".
+fn shorten_urls(n: &mut Node) {
+    fn collect<'a>(n: &'a mut Node, out: &mut Vec<&'a mut String>) {
+        for c in &mut n.children {
+            collect(c, out);
+        }
+        if n.role != "AXImage" {
+            if let Some(u) = n.url.as_mut() {
+                *u = short_url(u).to_string();
+                out.push(u);
+            }
+        }
+        if n.value_is_url {
+            out.extend(n.value.as_mut());
+        }
+    }
+    let mut urls = vec![];
+    collect(n, &mut urls);
+    if urls.iter().map(|u| u.chars().count()).sum::<usize>() <= 4000 {
+        return;
+    }
+    let mut used = 0;
+    for u in urls {
+        let mut s: String = u.split('?').next().unwrap_or_default().to_string();
+        if s.chars().count() > 20 {
+            s = s.chars().take(19).chain(['…']).collect();
+        }
+        if used + s.chars().count() > 4000 {
+            s = "…".into();
+        }
+        used += s.chars().count();
+        *u = s;
+    }
+}
+
 fn emit(n: Node, depth: usize, tree: &mut Tree) {
     if n.role == "AXWebArea" && !n.children.is_empty() {
         tree.web_areas += 1;
@@ -1001,7 +1056,8 @@ pub fn render(root: AXRef, depth: usize, max_depth: usize, tree: &mut Tree) {
         .is_some_and(|b| crate::apps::BROWSERS.contains(&b.to_string().as_str()))
         || pid(root).and_then(|p| objc2_app_kit::NSRunningApplication::runningApplicationWithProcessIdentifier(p)?.bundleURL()?.path())
             .is_some_and(|p| std::path::Path::new(&format!("{p}/Contents/Frameworks/Electron Framework.framework")).exists());
-    if let Some(n) = fetch(root, 0, max_depth, &mut budget, browser).and_then(transform) {
+    if let Some(mut n) = fetch(root, 0, max_depth, &mut budget, browser).and_then(transform) {
+        shorten_urls(&mut n);
         emit(n, depth, tree);
     }
 }

@@ -659,8 +659,8 @@ fn fetch(e: AXRef, depth: usize, max_depth: usize, budget: &mut usize, browser: 
         (.., v) => v,
     };
     // Labels never read as settable; in browsers, where Chromium reports a settable AXValue on
-    // everything, only text inputs and toggles do.
-    let text_input = matches!(role.as_str(), "AXTextField" | "AXTextArea");
+    // everything, only text inputs, toggles and unselected tabs (radio buttons) do.
+    let text_input = matches!(role.as_str(), "AXTextField" | "AXTextArea" | "AXRadioButton");
     let toggle = value_type == Some("boolean");
     let value_settable =
         role != "AXStaticText" && (!browser || text_input || toggle) && raw(5).is_some() && settable(e, "AXValue");
@@ -977,7 +977,8 @@ fn transform(mut n: Node) -> Option<Node> {
     }
     // flattenRepetitiveStaticText: labels repeating the parent's own text add nothing.
     if !n.can_interact() && !n.focusable && !n.selectable && !n.any_below(Node::can_interact) {
-        let own: Vec<&str> = [&n.desc, &n.value].into_iter().filter_map(|v| v.as_deref()).map(str::trim).collect();
+        // Only the parent's value counts: Codex keeps a label repeating its description.
+        let own: Vec<&str> = [&n.value].into_iter().filter_map(|v| v.as_deref()).map(str::trim).collect();
         let own: Vec<String> = own.into_iter().map(String::from).collect();
         n.children.retain(|c| {
             let t = c.desc.as_ref().or(c.value.as_ref()).map(|t| t.trim().to_string());

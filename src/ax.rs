@@ -628,10 +628,11 @@ fn fetch(e: AXRef, depth: usize, max_depth: usize, budget: &mut usize, browser: 
         }
     });
     let subrole = text(1).unwrap_or_default();
-    // Text areas show their styled text as Markdown; toggle buttons read as on/off.
+    // Text areas show their styled text as Markdown; switch and toggle checkboxes read as
+    // on/off (a toggle radio button keeps its number).
     let value = match (role.as_str(), subrole.as_str(), text(5)) {
         ("AXTextArea", ..) => crate::text::markdown(e).map(|m| m.text).filter(|t| !t.is_empty()),
-        (_, "AXToggle" | "AXSwitch", Some(v)) if v == "0" || v == "1" => Some(if v == "1" { "on" } else { "off" }.into()),
+        ("AXCheckBox", "AXToggle" | "AXSwitch", Some(v)) if v == "0" || v == "1" => Some(if v == "1" { "on" } else { "off" }.into()),
         (.., v) => v,
     };
     // Labels never read as settable; in browsers, where Chromium reports a settable AXValue on

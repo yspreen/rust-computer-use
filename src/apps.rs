@@ -95,7 +95,13 @@ pub fn resolve(q: &str) -> Result<App, String> {
     if let Some(a) = found {
         return Ok(a);
     }
-    let ok = Command::new("/usr/bin/open").args(["-g", "-a", &path]).status().is_ok_and(|s| s.success());
+    // An Electron host (Claude Code, T3 Code) leaks ELECTRON_RUN_AS_NODE, which `open` passes on
+    // and which turns any Electron app into a bare node that exits at once.
+    let ok = Command::new("/usr/bin/open")
+        .args(["-g", "-a", &path])
+        .env_remove("ELECTRON_RUN_AS_NODE")
+        .status()
+        .is_ok_and(|s| s.success());
     for _ in 0..50 {
         std::thread::sleep(std::time::Duration::from_millis(100));
         if let Some(a) = running().into_iter().find(|a| ok && a.path == path) {

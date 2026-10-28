@@ -63,11 +63,17 @@ pub fn relay(app: &PathBuf) -> Result<(), String> {
     let writer = Arc::new(Mutex::new(stream.try_clone().map_err(|e| e.to_string())?));
     let handshake: Arc<Mutex<Vec<String>>> = Arc::default();
     let closed = Arc::new(AtomicBool::new(false));
+    // Requests sent but not yet answered: if the service dies they would never be.
+    let pending: Arc<Mutex<Vec<serde_json::Value>>> = Arc::default();
     {
-        let (writer, handshake, closed) = (writer.clone(), handshake.clone(), closed.clone());
+        let (writer, handshake, closed, pending) = (writer.clone(), handshake.clone(), closed.clone(), pending.clone());
         std::thread::spawn(move || {
             for line in std::io::stdin().lock().lines().map_while(Result::ok) {
-                let method = serde_json::from_str::<serde_json::Value>(&line).ok().and_then(|m| m["method"].as_str().map(String::from));
+                let msg = serde_json::from_str::<serde_json::Value>(&line).ok();
+                let method = msg.as_ref().and_then(|m| m["method"].as_str().map(String::from));
+                if let Some(id) = msg.as_ref().map(|m| m["id"].clone()).filter(|id| !id.is_null() && method.is_some()) {
+                    pending.lock().unwrap().push(id);
+                }
                 if matches!(method.as_deref(), Some("initialize" | "notifications/initialized")) {
                     handshake.lock().unwrap().push(line.clone());
                 }
@@ -89,6 +95,9 @@ pub fn relay(app: &PathBuf) -> Result<(), String> {
                 replayed_id = None;
                 continue;
             }
+            if let Some(id) = reply.as_ref().map(|r| r["id"].clone()) {
+                pending.lock().unwrap().retain(|p| *p != id);
+            }
             // Line by line, so every message reaches the host as soon as it is complete.
             if out.write_all(line.as_bytes()).and_then(|_| out.flush()).is_err() {
                 return Ok(());
@@ -97,6 +106,12 @@ pub fn relay(app: &PathBuf) -> Result<(), String> {
         }
         if closed.load(SeqCst) {
             return Ok(());
+        }
+        // The service went away mid-request: fail what it never answered rather than leave
+        // the host waiting (repeating it could repeat a click).
+        for id in pending.lock().unwrap().drain(..) {
+            let err = serde_json::json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32603, "message": "Computer Use server error: the service stopped while handling this request"}});
+            let _ = writeln!(out, "{err}").and_then(|_| out.flush());
         }
         let stream = connect(app)?;
         let mut w = writer.lock().unwrap();

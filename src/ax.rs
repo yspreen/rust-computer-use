@@ -696,7 +696,8 @@ fn fetch(e: AXRef, depth: usize, max_depth: usize, budget: &mut usize, browser: 
         // Rows, then whatever else the table holds besides rows and columns (its header).
         // Columns repeat the rows, and so does a web table's header group of cells.
         let cells_only = |c: AXRef| {
-            let kids = attr(c, "AXChildren").map(|k| elements(&k)).unwrap_or_default();
+            let Some(list) = attr(c, "AXChildren") else { return false };
+            let kids = elements(&list); // borrowed from `list`, which must outlive them
             !kids.is_empty() && kids.iter().all(|&k| attr_str(k, "AXRole").as_deref() == Some("AXCell"))
         };
         let rest = children_raw.iter().copied()

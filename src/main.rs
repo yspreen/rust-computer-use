@@ -558,7 +558,19 @@ const SELECTION_NOTE: &str = "Note: Pay special attention to the content selecte
 /// focused element or, failing that, the focused element itself, like the original.
 fn render(app: &apps::App) -> Result<(ax::Tree, Cf), String> {
     let root = ax::app_element(app.pid);
-    let win = ax::window(root.0).ok_or(server_err(format!("'{}' has no open window", app.name)))?;
+    // A running app without windows gets the reopen event a Dock click sends (the original
+    // opens it again with an Apple event, without activating), then up to 5 s to show one.
+    let win = match ax::window(root.0) {
+        Some(w) => w,
+        None => {
+            let _ = std::process::Command::new("/usr/bin/open").args(["-g", "-a", &app.path])
+                .env_remove("ELECTRON_RUN_AS_NODE").status();
+            (0..50).find_map(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                ax::window(root.0)
+            }).ok_or("Computer Use server error -10005: noWindowsAvailable")?
+        }
+    };
     // A minimized window is restored (without activating the app), as the original does.
     if ax::attr_str(win.0, "AXMinimized").as_deref() == Some("on") && ax::set_bool(win.0, "AXMinimized", false).is_ok() {
         std::thread::sleep(std::time::Duration::from_millis(600));

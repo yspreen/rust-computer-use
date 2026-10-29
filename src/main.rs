@@ -635,10 +635,11 @@ fn state(snaps: &mut HashMap<i32, Snapshot>, app: &apps::App, full: bool) -> Res
     // The AX window's own number; a frame match alone can pick a same-sized popup (Chrome's omnibox).
     let window_id = ax::window_id(win.0).or_else(|| window_id(app.pid, frame)).unwrap_or(0);
     // The window server's title first (Chrome's omits the app name), then the AX title.
-    let title = window_name(window_id).filter(|t| !t.is_empty()).or_else(|| ax::attr_str(win.0, "AXTitle").filter(|t| !t.is_empty()))
+    let title = window_name(window_id).or_else(|| ax::attr_str(win.0, "AXTitle").filter(|t| !t.is_empty()))
         // Finder's desktop is a scroll area, not a window; the original calls it "Desktop".
         .or_else(|| (ax::attr_str(win.0, "AXRole").as_deref() == Some("AXScrollArea")).then(|| "Desktop".into()))
-        // A titleless window (a sheet) reads as "Unknown" in the original.
+        // A window the window server names "" stays ""; one it gives no name and no AX title (a
+        // sheet) reads as "Unknown".
         .unwrap_or_else(|| "Unknown".into());
     let note = if app.bundle_id == "com.spotify.client" { format!("\n{SPOTIFY_NOTE}\n") } else { String::new() };
     let window = format!("Window: \"{title}\", App: {}.\n{}{note}", app.name, tree.text);
@@ -728,7 +729,8 @@ fn window_name(id: u32) -> Option<String> {
     }
     let d = unsafe { CFArrayGetValueAtIndex(list.0 as _, 0) };
     let v = unsafe { CFDictionaryGetValue(d as _, ax::cfstr("kCGWindowName").0) };
-    (!v.is_null()).then(|| ax::to_string(v)).flatten()
+    // A present but empty name is kept: the original prints it as "", unlike a missing one.
+    (!v.is_null()).then(|| ax::to_string(v).unwrap_or_default())
 }
 
 /// CGWindowID of the app's window closest to the AX window frame. All windows count, so

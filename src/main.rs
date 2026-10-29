@@ -585,11 +585,11 @@ fn render(app: &apps::App) -> Result<(ax::Tree, Cf), String> {
     let index_of = |e: *const std::ffi::c_void| {
         tree.elems.iter().position(|x| unsafe { core_foundation_sys::base::CFEqual(x.0, e) } != 0)
     };
-    // Catalyst's root content group is not reported (observed behavior; the original's check
-    // wasn't located). Focus outside the rendered window has no index and is skipped below; a
+    // Catalyst's root content group and SwiftUI's hosting view are not reported (observed in
+    // Clock and Tips; the original's check wasn't located). Focus outside the rendered window has no index and is skipped below; a
     // sheet's elements name the parent window as AXWindow, so that attribute can't decide it.
     let focused = ax::attr(root.0, "AXFocusedUIElement")
-        .filter(|f| ax::attr_str(f.0, "AXSubrole").as_deref() != Some("iOSContentGroup"));
+        .filter(|f| !matches!(ax::attr_str(f.0, "AXSubrole").as_deref(), Some("iOSContentGroup" | "AXHostingView")));
     let selected: Vec<usize> = focused
         .as_ref()
         .and_then(|f| ax::attr(f.0, "AXSelectedRows").or_else(|| ax::attr(f.0, "AXSelectedChildren")))

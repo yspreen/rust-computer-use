@@ -275,8 +275,18 @@ fn call(srv: &mut Server, name: &str, a: &Value) -> Result<Value, String> {
     act(snap, name, a, &app, &srv.enforcers[&app.pid])?;
     // Actions answer with the resulting state once the UI settles, as the original does.
     settle(app.pid);
-    state(&mut srv.snaps, &app, false)
-        .or_else(|_| Ok(text("Action completed. Call `get_app_state` to fetch the updated UI state.")))
+    state(&mut srv.snaps, &app, false).or_else(|_| {
+        // An app that quit (Calculator closing its last window) or lost every window is an error.
+        let running = objc2_app_kit::NSRunningApplication::runningApplicationWithProcessIdentifier(app.pid)
+            .is_some_and(|a| !a.isTerminated());
+        if !running {
+            return Err("Computer Use server error -10005: App quit".into());
+        }
+        if ax::window(ax::app_element(app.pid).0).is_none() {
+            return Err("Computer Use server error -10005: noWindowsAvailable".into());
+        }
+        Ok(text("Action completed. Call `get_app_state` to fetch the updated UI state."))
+    })
 }
 
 /// The menu the original treats as open per app: a menu bar item it "clicked" without pressing

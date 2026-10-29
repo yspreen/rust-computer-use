@@ -585,12 +585,11 @@ fn render(app: &apps::App) -> Result<(ax::Tree, Cf), String> {
     let index_of = |e: *const std::ffi::c_void| {
         tree.elems.iter().position(|x| unsafe { core_foundation_sys::base::CFEqual(x.0, e) } != 0)
     };
-    // Focus inside another window (Catalyst keeps it behind a sheet) is not reported, nor is
-    // Catalyst's root content group (observed behavior; the original's check wasn't located).
-    let focused = ax::attr(root.0, "AXFocusedUIElement").filter(|f| {
-        ax::attr(f.0, "AXWindow").is_none_or(|w| unsafe { core_foundation_sys::base::CFEqual(w.0, win.0) } != 0)
-            && ax::attr_str(f.0, "AXSubrole").as_deref() != Some("iOSContentGroup")
-    });
+    // Catalyst's root content group is not reported (observed behavior; the original's check
+    // wasn't located). Focus outside the rendered window has no index and is skipped below; a
+    // sheet's elements name the parent window as AXWindow, so that attribute can't decide it.
+    let focused = ax::attr(root.0, "AXFocusedUIElement")
+        .filter(|f| ax::attr_str(f.0, "AXSubrole").as_deref() != Some("iOSContentGroup"));
     let selected: Vec<usize> = focused
         .as_ref()
         .and_then(|f| ax::attr(f.0, "AXSelectedRows").or_else(|| ax::attr(f.0, "AXSelectedChildren")))
@@ -636,10 +635,11 @@ fn state(snaps: &mut HashMap<i32, Snapshot>, app: &apps::App, full: bool) -> Res
     // The AX window's own number; a frame match alone can pick a same-sized popup (Chrome's omnibox).
     let window_id = ax::window_id(win.0).or_else(|| window_id(app.pid, frame)).unwrap_or(0);
     // The window server's title first (Chrome's omits the app name), then the AX title.
-    let title = window_name(window_id).or_else(|| ax::attr_str(win.0, "AXTitle"))
+    let title = window_name(window_id).filter(|t| !t.is_empty()).or_else(|| ax::attr_str(win.0, "AXTitle").filter(|t| !t.is_empty()))
         // Finder's desktop is a scroll area, not a window; the original calls it "Desktop".
         .or_else(|| (ax::attr_str(win.0, "AXRole").as_deref() == Some("AXScrollArea")).then(|| "Desktop".into()))
-        .unwrap_or_default();
+        // A titleless window (a sheet) reads as "Unknown" in the original.
+        .unwrap_or_else(|| "Unknown".into());
     let note = if app.bundle_id == "com.spotify.client" { format!("\n{SPOTIFY_NOTE}\n") } else { String::new() };
     let window = format!("Window: \"{title}\", App: {}.\n{}{note}", app.name, tree.text);
     let body = if full {

@@ -163,9 +163,31 @@ fn menu_bar_only(path: &str) -> bool {
         .is_some_and(|v| v.downcast_ref::<NSNumber>().is_some_and(|n| n.boolValue()))
 }
 
+type Recent = Vec<(String, String, String, String, i64)>;
+
+/// The Spotlight answer below, which takes 60 ms or more and barely changes: the last one is
+/// served, and refreshed in the background once it is a minute old.
+fn recent() -> Recent {
+    static CACHE: std::sync::Mutex<Option<(std::time::Instant, Recent)>> = std::sync::Mutex::new(None);
+    let mut cache = CACHE.lock().unwrap();
+    let Some((at, rows)) = cache.as_mut() else {
+        let rows = spotlight();
+        *cache = Some((std::time::Instant::now(), rows.clone()));
+        return rows;
+    };
+    if at.elapsed() > std::time::Duration::from_secs(60) {
+        *at = std::time::Instant::now();
+        std::thread::spawn(|| {
+            let rows = spotlight();
+            *CACHE.lock().unwrap() = Some((std::time::Instant::now(), rows));
+        });
+    }
+    rows.clone()
+}
+
 /// Same Spotlight query the original service runs: apps used in the last 14 days.
 /// One row per bundle id (name, path, bundle id, UTC date as the original prints it, uses).
-fn recent() -> Vec<(String, String, String, String, i64)> {
+fn spotlight() -> Recent {
     let q = r#"kMDItemContentType == "com.apple.application-bundle" && kMDItemLastUsedDate_Ranking >= $time.today(-14)"#;
     let out = Command::new("/usr/bin/mdfind").arg(q).output().map(|o| o.stdout).unwrap_or_default();
     let paths: Vec<String> = String::from_utf8_lossy(&out).lines().map(String::from).collect();

@@ -623,6 +623,10 @@ impl Cursor {
             self.raised = true;
             self.window.setLevel(102);
             self.window.orderFrontRegardless();
+        } else {
+            // The target may have come forward (or reopened its window) since the last action,
+            // which would leave the cursor under it.
+            self.stack_above_target();
         }
         if (to - from).len() <= SCOOT_DISTANCE {
             let dir = (to - from).norm();
@@ -709,27 +713,35 @@ fn top_window_at(p: Pt) -> Option<u32> {
 
 static LAST_USE: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
 
-/// Glide the cursor to `p` (CG global points) over `window`, returning once it is close
-/// enough to act, as the original's click does (the spring keeps settling afterwards).
+/// When the latest glide gets close enough to show a press, for press to wait on.
+static ARRIVAL: std::sync::Mutex<Option<mpsc::Receiver<()>>> = std::sync::Mutex::new(None);
+
+/// Glide the cursor to `p` (CG global points) over `window`. Returns at once: the cursor only
+/// shows the action, which goes out without waiting for it (the original waits).
 pub fn move_to(p: Pt, window: u32) {
     let (tx, rx) = mpsc::channel();
     touch();
+    *ARRIVAL.lock().unwrap() = Some(rx);
     DispatchQueue::main().exec_async(move || {
         let mtm = MainThreadMarker::new().unwrap();
         let to = V(p.x, main_height(mtm) - p.y);
         CURSOR.with(|c| c.borrow_mut().get_or_insert_with(|| make(mtm)).move_to(to, window, tx));
     });
-    let _ = rx.recv_timeout(Duration::from_secs(3));
 }
 
-/// Show the pressed state for each click: 50 ms down (cursorPressAnimationTime), 50 ms up.
+/// Show the pressed state for each click once the cursor gets there: 50 ms down
+/// (cursorPressAnimationTime), 50 ms up. Returns at once.
 pub fn press(count: i64) {
-    for _ in 0..count.max(1) {
-        set_pressed(true);
-        std::thread::sleep(Duration::from_millis(50));
-        set_pressed(false);
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let arrival = ARRIVAL.lock().unwrap().take();
+    std::thread::spawn(move || {
+        arrival.map(|rx| rx.recv_timeout(Duration::from_secs(3)));
+        for _ in 0..count.max(1) {
+            set_pressed(true);
+            std::thread::sleep(Duration::from_millis(50));
+            set_pressed(false);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    });
 }
 
 fn set_pressed(on: bool) {

@@ -42,6 +42,28 @@ extern "C" {
 #[repr(C)]
 struct Rect { x: f64, y: f64, w: f64, h: f64 }
 
+type Ref = *const std::ffi::c_void;
+
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGWindowListCreateImage(bounds: Rect, list: u32, window: u32, image: u32) -> Ref;
+    fn CGImageGetWidth(image: Ref) -> usize;
+    fn CGImageGetHeight(image: Ref) -> usize;
+    fn CGColorSpaceCreateDeviceRGB() -> Ref;
+    fn CGBitmapContextCreate(data: *mut std::ffi::c_void, w: usize, h: usize, bits: usize, row: usize, space: Ref, info: u32) -> Ref;
+    fn CGContextSetInterpolationQuality(c: Ref, quality: i32);
+    fn CGContextDrawImage(c: Ref, r: Rect, image: Ref);
+    fn CGBitmapContextCreateImage(c: Ref) -> Ref;
+}
+
+#[link(name = "ImageIO", kind = "framework")]
+extern "C" {
+    fn CGImageDestinationCreateWithData(data: Ref, ty: Ref, count: usize, options: Ref) -> Ref;
+    fn CGImageDestinationAddImage(d: Ref, image: Ref, properties: Ref);
+    fn CGImageDestinationFinalize(d: Ref) -> bool;
+    static kCGImageDestinationLossyCompressionQuality: Ref;
+}
+
 /// Share of a frame (global top-left coordinates) that lies on some display.
 fn on_display(f: (f64, f64, f64, f64)) -> f64 {
     let (mut ids, mut n) = ([0u32; 16], 0u32);
@@ -109,6 +131,10 @@ fn main() {
         })
     }
     if service {
+        std::thread::spawn(|| {
+            warm_capture();
+            apps::list();
+        });
         overlay::run(|| service::listen(serve))
     }
     overlay::run(|| serve(Box::new(std::io::BufReader::new(std::io::stdin())), Box::new(std::io::stdout())))
@@ -586,11 +612,10 @@ fn settle(pid: i32) {
     drop(observer);
 }
 
-/// Post the click while the cursor shows it being pressed.
+/// Post the click; the cursor shows it being pressed on its own time.
 fn click_with_cursor(at: Pt, button: &str, count: i64, hover: bool) {
-    let shown = std::thread::spawn(move || cursor::press(count));
+    cursor::press(count);
     input::click(at, button, count, hover);
-    let _ = shown.join();
 }
 
 const SELECTION_NOTE: &str = "Note: Pay special attention to the content selected by the user. If the user asks a question or refers to the content they are looking at on-screen, they might be referring to the selected content (but they might be referring to something else that's visible, too).";
@@ -733,14 +758,14 @@ fn state(snaps: &mut HashMap<i32, Snapshot>, app: &apps::App, full: bool) -> Res
     let mut content = vec![json!({"type": "text", "text": body})];
     let mut image = (frame.2, frame.3);
     let menu_open = recorded_menu(app.pid).is_some() || ax::open_menu(ax::app_element(app.pid).0).is_some(); // no screenshot then
-    match screenshot(window_id) {
-        Ok(_) if menu_open => {}
-        Ok((jpeg, size)) => {
+    match (!menu_open).then(|| screenshot(window_id)) {
+        None => {}
+        Some(Ok((jpeg, size))) => {
             image = size;
             let data = base64::engine::general_purpose::STANDARD.encode(jpeg);
             content.push(json!({"type": "image", "data": data, "mimeType": "image/jpeg"}));
         }
-        Err(e) => content.push(json!({"type": "text", "text": format!("Screenshot unavailable: {e}")})),
+        Some(Err(e)) => content.push(json!({"type": "text", "text": format!("Screenshot unavailable: {e}")})),
     }
     snaps.insert(app.pid, Snapshot { taken: std::time::Instant::now(), tree, window: frame, window_id, image });
     Ok(Value::Array(content))
@@ -819,10 +844,62 @@ fn window_id(pid: i32, frame: (f64, f64, f64, f64)) -> Option<u32> {
 
 const MAX_IMAGE: u32 = 2000;
 
+/// One window's pixels without its shadow (screencapture -o), at full resolution. The first
+/// call in a process takes 0.1 s, so the service makes one as it starts (`warm_capture`).
+fn window_image(id: u32) -> Cf {
+    let null = Rect { x: f64::INFINITY, y: f64::INFINITY, w: 0.0, h: 0.0 }; // CGRectNull: the window's bounds
+    Cf(unsafe { CGWindowListCreateImage(null, 8, id, 1 | 8) }) // IncludingWindow; IgnoreFraming | BestResolution
+}
+
+pub fn warm_capture() {
+    drop(Cf(unsafe { CGWindowListCreateImage(Rect { x: 0.0, y: 0.0, w: 1.0, h: 1.0 }, 1, 0, 0) }));
+}
+
+/// JPEG of one window, made in this process: about 15 ms where screencapture takes 130.
+fn capture(id: u32) -> Option<(Vec<u8>, (f64, f64))> {
+    use core_foundation_sys::{data::*, dictionary::*, number::*};
+    let image = window_image(id);
+    if image.0.is_null() {
+        return None;
+    }
+    let (w, h) = unsafe { (CGImageGetWidth(image.0), CGImageGetHeight(image.0)) };
+    let k = (MAX_IMAGE as f64 / w.max(h).max(1) as f64).min(1.0);
+    let (sw, sh) = (((w as f64 * k).round() as usize).max(1), ((h as f64 * k).round() as usize).max(1));
+    let image = if k < 1.0 {
+        let space = Cf(unsafe { CGColorSpaceCreateDeviceRGB() });
+        let ctx = Cf(unsafe { CGBitmapContextCreate(std::ptr::null_mut(), sw, sh, 8, 0, space.0, 5) }); // RGB, no alpha
+        unsafe {
+            CGContextSetInterpolationQuality(ctx.0, 3); // high
+            CGContextDrawImage(ctx.0, Rect { x: 0.0, y: 0.0, w: sw as f64, h: sh as f64 }, image.0);
+        }
+        Cf(unsafe { CGBitmapContextCreateImage(ctx.0) })
+    } else {
+        image
+    };
+    let quality = 0.8f64;
+    let quality = Cf(unsafe { CFNumberCreate(std::ptr::null(), kCFNumberFloat64Type, &quality as *const f64 as _) } as _);
+    let keys = [unsafe { kCGImageDestinationLossyCompressionQuality }];
+    let options = Cf(unsafe { CFDictionaryCreate(std::ptr::null(), keys.as_ptr(), &quality.0, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks) } as _);
+    let data = Cf(unsafe { CFDataCreateMutable(std::ptr::null(), 0) } as _);
+    let dest = Cf(unsafe { CGImageDestinationCreateWithData(data.0, ax::cfstr("public.jpeg").0, 1, std::ptr::null()) });
+    if image.0.is_null() || dest.0.is_null() {
+        return None;
+    }
+    unsafe { CGImageDestinationAddImage(dest.0, image.0, options.0) };
+    if !unsafe { CGImageDestinationFinalize(dest.0) } {
+        return None;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(CFDataGetBytePtr(data.0 as _), CFDataGetLength(data.0 as _) as usize) };
+    Some((bytes.to_vec(), (sw as f64, sh as f64)))
+}
+
 /// JPEG of one window, full resolution up to MAX_IMAGE pixels on the long edge.
 fn screenshot(id: u32) -> Result<(Vec<u8>, (f64, f64)), String> {
     if id == 0 {
         return Err("no on-screen window".into());
+    }
+    if let Some(shot) = capture(id) {
+        return Ok(shot);
     }
     let path = std::env::temp_dir().join(format!("rust-computer-use-{id}.jpg"));
     let p = path.to_str().unwrap();

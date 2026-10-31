@@ -59,8 +59,9 @@ which changes every build, unless you pass a certificate (`CODESIGN_IDENTITY`).
 
 While the agent works, a cursor shows where it acts. It is the original's
 shape, and it moves the way the original's does. Long moves follow the best of 20
-candidate curves, timed by a spring, and short hops stretch and tilt. The click
-goes out once the cursor is close enough, and the cursor dips when it presses.
+candidate curves, timed by a spring, and short hops stretch and tilt. The cursor
+dips when it gets there. Unlike the original's, it only shows the action: the
+click goes out at once, without waiting for the cursor.
 It sits just above the app it works in, so windows covering that app cover the
 cursor too. When the app's window isn't on screen (another Space, or a hidden
 AeroSpace workspace) it skips the animation. It fades away after a few idle
@@ -107,8 +108,10 @@ seconds. Your real pointer never moves.
   have been quiet for 0.25 s, at most 5 s.
 - **Hung apps:** every call first asks the app for its role, with a 2 s timeout.
   An app that doesn't answer fails the call with `appNotResponding`.
-- **Screenshot:** `screencapture -l<windowID>`, JPEG, at full resolution. It works
-  for windows on other Spaces too.
+- **Screenshot:** the window's own pixels (`CGWindowListCreateImage`), encoded
+  as JPEG in the service, at full resolution up to 2000 px on the long edge. It
+  takes about 15 ms, where `screencapture` takes 130, and works for windows that
+  are covered or off-screen. `screencapture -l<windowID>` is the fallback.
 - **`app`** also accepts a pid, which picks one instance when several share a
   bundle ID.
 

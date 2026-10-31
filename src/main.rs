@@ -35,6 +35,21 @@ struct Snapshot {
 extern "C" {
     fn CGWindowListCopyWindowInfo(option: u32, relative_to: u32) -> CFArrayRef;
     fn CGSessionCopyCurrentDictionary() -> *const std::ffi::c_void;
+    fn CGGetActiveDisplayList(max: u32, displays: *mut u32, count: *mut u32) -> i32;
+    fn CGDisplayBounds(display: u32) -> Rect;
+}
+
+#[repr(C)]
+struct Rect { x: f64, y: f64, w: f64, h: f64 }
+
+/// Share of a frame (global top-left coordinates) that lies on some display.
+fn on_display(f: (f64, f64, f64, f64)) -> f64 {
+    let (mut ids, mut n) = ([0u32; 16], 0u32);
+    unsafe { CGGetActiveDisplayList(16, ids.as_mut_ptr(), &mut n) };
+    let seen: f64 = ids[..n as usize].iter().map(|&d| unsafe { CGDisplayBounds(d) }).map(|d| {
+        ((f.0 + f.2).min(d.x + d.w) - f.0.max(d.x)).max(0.0) * ((f.1 + f.3).min(d.y + d.h) - f.1.max(d.y)).max(0.0)
+    }).sum();
+    seen / (f.2 * f.3).max(1.0)
 }
 
 /// JSON-RPC, one message per line.
@@ -631,6 +646,8 @@ fn render(app: &apps::App) -> Result<(ax::Tree, Cf), String> {
     Ok((tree, win))
 }
 
+const OFFSCREEN_NOTE: &str = "Note: This window is mostly outside every display (a window manager may have moved it off-screen), so the user can't see it right now. Actions still reach it.";
+
 const SPOTIFY_NOTE: &str = "Note: In order to be usable, Spotify app links must be rewritten as regular links (e.g. use open.spotify.com instead of xpui.app.spotify.com). Only use Spotify links that are written verbatim in the UI above. Note that IDs are only valid with their associated type (e.g. you cannot change an \"album\" URL to a \"track\" URL).";
 
 /// The original's per-app notes: one for browsers, and a file per app named after it.
@@ -663,7 +680,12 @@ fn state(snaps: &mut HashMap<i32, Snapshot>, app: &apps::App, full: bool) -> Res
         // A window the window server names "" stays ""; one it gives no name and no AX title (a
         // sheet) reads as "Unknown".
         .unwrap_or_else(|| "Unknown".into());
-    let note = if app.bundle_id == "com.spotify.client" { format!("\n{SPOTIFY_NOTE}\n") } else { String::new() };
+    let mut note = if app.bundle_id == "com.spotify.client" { format!("\n{SPOTIFY_NOTE}\n") } else { String::new() };
+    // Not in the original: a window parked off-screen (another AeroSpace workspace, say) still
+    // captures and takes actions, so nothing else tells the model the user can't see it.
+    if on_display(frame) < 0.5 {
+        note += &format!("\n{OFFSCREEN_NOTE}\n");
+    }
     let window = format!("Window: \"{title}\", App: {}.\n{}{note}", app.name, tree.text);
     let body = if full {
         let tips = instructions(app).map(|t| format!("<app_specific_instructions>\n{t}\n</app_specific_instructions>\n")).unwrap_or_default();
@@ -762,7 +784,9 @@ fn window_id(pid: i32, frame: (f64, f64, f64, f64)) -> Option<u32> {
     windows(pid, false).into_iter().min_by_key(|w| dist(w.1)).map(|w| w.0)
 }
 
-/// Full-resolution JPEG of one window, as the original sends it.
+const MAX_IMAGE: u32 = 2000;
+
+/// JPEG of one window, full resolution up to MAX_IMAGE pixels on the long edge.
 fn screenshot(id: u32) -> Result<(Vec<u8>, (f64, f64)), String> {
     if id == 0 {
         return Err("no on-screen window".into());
@@ -773,10 +797,20 @@ fn screenshot(id: u32) -> Result<(Vec<u8>, (f64, f64)), String> {
     if !ok.is_ok_and(|s| s.success()) {
         return Err("screencapture failed (Screen Recording permission?)".into());
     }
-    let jpeg = std::fs::read(&path).map_err(|e| e.to_string())?;
+    let read = || -> Result<(Vec<u8>, (f64, f64)), String> {
+        let jpeg = std::fs::read(&path).map_err(|e| e.to_string())?;
+        let size = jpeg_size(&jpeg).ok_or("unreadable JPEG")?;
+        Ok((jpeg, size))
+    };
+    let mut shot = read();
+    // Clients shrink larger images (Claude Code to 2000 px) and the model then reads coordinates
+    // off the smaller one; shrinking here keeps screenshot pixels and click pixels the same.
+    if shot.as_ref().is_ok_and(|(_, (w, h))| w.max(*h) > MAX_IMAGE as f64) {
+        let _ = Command::new("/usr/bin/sips").args(["-Z", &MAX_IMAGE.to_string(), p]).output();
+        shot = read();
+    }
     let _ = std::fs::remove_file(&path);
-    let size = jpeg_size(&jpeg).ok_or("unreadable JPEG")?;
-    Ok((jpeg, size))
+    shot
 }
 
 /// Read pixel dimensions from the JPEG SOF marker.

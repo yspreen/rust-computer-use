@@ -186,6 +186,13 @@ pub fn app_element(pid: i32) -> Cf {
 /// Apps whose web accessibility this process switched on, and the attribute it used.
 static ENABLED: std::sync::Mutex<Vec<(i32, &'static str)>> = std::sync::Mutex::new(Vec::new());
 
+/// Whether the element lists an attribute among its names (it may answer others too).
+pub fn lists(e: AXRef, name: &str) -> bool {
+    let mut names: CFArrayRef = std::ptr::null();
+    let ok = unsafe { AXUIElementCopyAttributeNames(e, &mut names) } == 0 && !names.is_null();
+    ok && array(&Cf(names as _)).into_iter().filter_map(to_string).any(|n| n == name)
+}
+
 /// Chromium/Electron/Firefox only build their web trees when asked. Like the original, use
 /// AXManualAccessibility when the app lists it (Electron), else AXEnhancedUserInterface
 /// (Chrome, Firefox). The flag is set on every read: Chrome can drop its web tree while still
@@ -628,11 +635,26 @@ fn fetch(e: AXRef, depth: usize, max_depth: usize, budget: &mut usize, browser: 
         return None;
     }
     let children_raw = if depth < max_depth { kids(16) } else { vec![] };
-    // Like rows, 100 or more children are read only as far as they are visible (a grid of
-    // cells), in the order the element lists them as visible.
-    let visible = (children_raw.len() >= 100).then(|| attr(e, "AXVisibleChildren")).flatten();
+    // The original's visibleElementsCalculatingSubset: 100 or more children are read as far as
+    // an element that lists AXVisibleChildren calls them visible, at most 500. A run of
+    // consecutive children reads as that run, noted as a subset (Photos' grid); anything else
+    // as the visible list itself (Font Book's grid, which puts a row's cells before its labels).
+    let mut child_subset = None;
+    let visible = (children_raw.len() >= 100 && lists(e, "AXVisibleChildren")).then(|| attr(e, "AXVisibleChildren")).flatten();
     let children_raw = match visible.as_ref().map(elements) {
-        Some(v) if !v.is_empty() => v, // borrowed from `visible`, which lives to the end
+        Some(v) if !v.is_empty() => {
+            let v = &v[..v.len().min(500)]; // borrowed from `visible`, which lives to the end
+            let at: Vec<usize> = v.iter().filter_map(|&x| children_raw.iter().position(|&c| unsafe { CFEqual(c, x) } != 0)).collect();
+            match (at.iter().min(), at.iter().max()) {
+                (Some(&lo), Some(&hi)) if at.len() == v.len() && v.len() > hi - lo => {
+                    if hi - lo + 1 < children_raw.len() {
+                        child_subset = Some((vec![(lo, hi + 1)], children_raw.len()));
+                    }
+                    children_raw[lo..=hi].to_vec()
+                }
+                _ => v.to_vec(),
+            }
+        }
         _ => children_raw,
     };
     if role == "AXMenuItem" && title.is_none() && children_raw.is_empty() {
@@ -698,7 +720,7 @@ fn fetch(e: AXRef, depth: usize, max_depth: usize, budget: &mut usize, browser: 
     // visible rows, noted as a subset.
     let rows = kids(19);
     let (children_raw, subset) = if depth >= max_depth || rows.is_empty() {
-        (children_raw, None)
+        (children_raw, child_subset)
     } else if rows.len() < 100 {
         // Rows, then whatever else the table holds besides rows and columns (its header).
         // Columns repeat the rows, and so does a web table's header group of cells.

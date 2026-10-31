@@ -45,6 +45,21 @@ extern "C" {
     fn AXValueCreate(t: u32, v: *const c_void) -> CFTypeRef;
     fn _AXUIElementGetWindow(e: AXRef, id: *mut u32) -> i32;
     fn AXUIElementCopyElementAtPosition(app: AXRef, x: f32, y: f32, out: *mut AXRef) -> i32;
+    fn AXUIElementSetMessagingTimeout(e: AXRef, seconds: f32) -> i32;
+}
+
+/// kAXErrorCannotComplete: the app didn't answer within the messaging timeout.
+const CANNOT_COMPLETE: i32 = -25204;
+
+/// Whether the app answers an AX request within 2 s. A hung app (TextEdit stuck in a save)
+/// costs the system's 6 s timeout on every call, which adds up to minutes over a tree.
+pub fn responsive(pid: i32) -> bool {
+    let app = app_element(pid);
+    let mut v: CFTypeRef = std::ptr::null();
+    unsafe { AXUIElementSetMessagingTimeout(app.0, 2.0) };
+    let err = unsafe { AXUIElementCopyAttributeValue(app.0, cfstr("AXRole").0 as _, &mut v) };
+    drop(Cf(v));
+    err != CANNOT_COMPLETE
 }
 
 /// The app's element at a screen point.
@@ -179,6 +194,15 @@ pub fn to_string(v: CFTypeRef) -> Option<String> {
     }
 }
 
+/// The current name on disk of the file an element's URL points to. Finder hands out file
+/// reference URLs, which follow the file through renames.
+pub fn file_name(e: AXRef) -> Option<String> {
+    use core_foundation_sys::url::*;
+    let url = attr(e, "AXURL").filter(|u| unsafe { CFGetTypeID(u.0) == CFURLGetTypeID() })?;
+    let path = Cf(unsafe { CFURLCreateFilePathURL(null(), url.0 as _, std::ptr::null_mut()) } as _);
+    (!path.0.is_null()).then(|| Cf(unsafe { CFURLCopyLastPathComponent(path.0 as _) } as _)).and_then(|n| to_string(n.0))
+}
+
 pub fn app_element(pid: i32) -> Cf {
     Cf(unsafe { AXUIElementCreateApplication(pid) })
 }
@@ -199,6 +223,9 @@ pub fn lists(e: AXRef, name: &str) -> bool {
 /// reporting the flag on, and only a fresh write brings it back. True for apps that take either flag.
 pub fn enable_web(pid: i32) -> bool {
     let app = app_element(pid);
+    // Chromium builds its web tree at once for a client that reads the application's role (what
+    // Apple advises assistive apps to do); after the flag alone it waits 2 s.
+    let _ = attr(app.0, "AXRole");
     let mut names: CFArrayRef = std::ptr::null();
     if unsafe { AXUIElementCopyAttributeNames(app.0, &mut names) } != 0 || names.is_null() {
         return false;
@@ -244,11 +271,15 @@ pub fn observe(pid: i32, names: &[&str], callback: ObserverCallback, context: *m
         return None;
     }
     let app = app_element(pid);
+    let obs = Cf(obs);
     for n in names {
-        unsafe { AXObserverAddNotification(obs, app.0, cfstr(n).0 as _, context) };
+        // A hung app times out each registration; one is enough to tell.
+        if unsafe { AXObserverAddNotification(obs.0, app.0, cfstr(n).0 as _, context) } == CANNOT_COMPLETE {
+            return None;
+        }
     }
-    unsafe { core_foundation_sys::runloop::CFRunLoopAddSource(core_foundation_sys::runloop::CFRunLoopGetCurrent(), AXObserverGetRunLoopSource(obs), core_foundation_sys::runloop::kCFRunLoopDefaultMode) };
-    Some(Cf(obs))
+    unsafe { core_foundation_sys::runloop::CFRunLoopAddSource(core_foundation_sys::runloop::CFRunLoopGetCurrent(), AXObserverGetRunLoopSource(obs.0), core_foundation_sys::runloop::kCFRunLoopDefaultMode) };
+    Some(obs)
 }
 
 pub fn run_loop_for(seconds: f64) {

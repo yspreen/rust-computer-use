@@ -85,8 +85,9 @@ seconds. Your real pointer never moves.
 - **Window title:** the window server's name for the window, then the AX title.
 - **Chromium and Electron:** `AXManualAccessibility` when the app lists it, else
   `AXEnhancedUserInterface`, written on every read because Chrome can drop its
-  web tree while still reporting the flag on. The flag is switched back off when
-  the session ends.
+  web tree while still reporting the flag on. The app's role is read first:
+  Chromium then builds the page's tree at once instead of 2 s later. The flag is
+  switched back off when the session ends.
 - **Background apps:** before the first synthesized event, the app gets the
   AppKit "application activated" event for its window and a press at the
   window's activation point. That's the original's trick. Without it, shortcuts
@@ -100,8 +101,12 @@ seconds. Your real pointer never moves.
   unicode events rather than dropped.
 - **Scroll:** one continuous pixel event of pages times the element's height or
   width.
-- **After an action:** the state is read once the app's AX notifications have
-  been quiet for 0.25 s, at most 5 s.
+- **After an action:** the app gets a flagsChanged event with no modifiers, so
+  AppKit finishes what it does at the end of an event (TextEdit deadlocks in a
+  later save otherwise). Then the state is read once the app's AX notifications
+  have been quiet for 0.25 s, at most 5 s.
+- **Hung apps:** every call first asks the app for its role, with a 2 s timeout.
+  An app that doesn't answer fails the call with `appNotResponding`.
 - **Screenshot:** `screencapture -l<windowID>`, JPEG, at full resolution. It works
   for windows on other Spaces too.
 - **`app`** also accepts a pid, which picks one instance when several share a
@@ -111,6 +116,8 @@ seconds. Your real pointer never moves.
 
 - The original's fog cursor blurs whatever is behind it. This one draws a soft
   shadow instead.
+- `set_value` on a Finder file name fails, and puts the real name back on screen,
+  when the file wasn't renamed. The original reports success.
 - Not reproduced: the URL blocklist (fetched from OpenAI), the lock-screen
   unlock helper, and the original's non-tool features (appshots, recording,
   Messages).

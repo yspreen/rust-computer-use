@@ -283,14 +283,26 @@ fn call(srv: &mut Server, name: &str, a: &Value) -> Result<Value, String> {
             return Err(format!("The user changed '{}'. Re-query the latest state with `get_app_state` before sending more actions.", app.name));
         }
     }
+    if !ax::responsive(app.pid) {
+        return Err(server_err("appNotResponding"));
+    }
+    // Sessions share the service, and input's target with it: one action at a time.
+    static ACTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let acting = ACTING.lock().unwrap();
     input::target(app.pid, snap.window_id, Pt { x: snap.window.0, y: snap.window.1 });
     if !srv.enforcers.contains_key(&app.pid) {
         srv.enforcers.insert(app.pid, focus::Enforcer::new(app.pid).map_err(server_err)?);
     }
-    act(snap, name, a, &app, &srv.enforcers[&app.pid])?;
+    let acted = act(snap, name, a, &app, &srv.enforcers[&app.pid]);
+    input::end_event(app.pid);
+    drop(acting);
+    acted?;
     // Actions answer with the resulting state once the UI settles, as the original does.
     settle(app.pid);
-    state(&mut srv.snaps, &app, false).or_else(|_| {
+    state(&mut srv.snaps, &app, false).or_else(|e| {
+        if e == server_err("appNotResponding") {
+            return Err(e);
+        }
         // An app that quit (Calculator closing its last window) or lost every window is an error.
         let running = objc2_app_kit::NSRunningApplication::runningApplicationWithProcessIdentifier(app.pid)
             .is_some_and(|a| !a.isTerminated());
@@ -471,7 +483,21 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App, enforcer: &focus
                 && (ax::set_bool(e.0, "AXFocused", true).is_err() || !ax::attr(e.0, "AXFocused").is_some_and(|v| ax::to_bool(v.0))) {
                 act(snap, "click", &json!({"element_index": index}), app, enforcer)?;
             }
-            ax::set_attr(e.0, "AXValue", ax::cfstr(a["value"].as_str().unwrap_or("")).0).map_err(server_err)?;
+            let value = a["value"].as_str().unwrap_or("");
+            let named = ax::file_name(e.0).filter(|_| ax::lists(e.0, "AXFilename"));
+            ax::set_attr(e.0, "AXValue", ax::cfstr(value).0).map_err(server_err)?;
+            // Finder's name field takes a value outside renaming without renaming the file. Not
+            // in the original, which reports success: put the real name back and say so.
+            if let Some(old) = named.filter(|old| old != value) {
+                let start = std::time::Instant::now();
+                while ax::file_name(e.0).as_ref() == Some(&old) && start.elapsed() < std::time::Duration::from_millis(500) {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                if ax::file_name(e.0).as_ref() == Some(&old) {
+                    let _ = ax::set_attr(e.0, "AXValue", ax::cfstr(&old).0);
+                    return Err(server_err(format!("Setting the name doesn't rename the file, which is still named \"{old}\". To rename it, click it, press Return, type the new name and press Return.")));
+                }
+            }
             // Search fields and address bars are submitted with Return, as the original does.
             let search = ax::attr_str(e.0, "AXSubrole").as_deref() == Some("AXSearchField")
                 || ax::attr_str(e.0, "AXIdentifier").as_deref() == Some("WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD")
@@ -572,6 +598,9 @@ const SELECTION_NOTE: &str = "Note: Pay special attention to the content selecte
 /// The key window's tree plus menu bar. It ends with what the user has selected in the
 /// focused element or, failing that, the focused element itself, like the original.
 fn render(app: &apps::App) -> Result<(ax::Tree, Cf), String> {
+    if !ax::responsive(app.pid) {
+        return Err(server_err("appNotResponding"));
+    }
     let root = ax::app_element(app.pid);
     // A running app without windows gets the reopen event a Dock click sends (the original
     // opens it again with an Apple event, without activating), then up to 5 s to show one.
@@ -597,6 +626,7 @@ fn render(app: &apps::App) -> Result<(ax::Tree, Cf), String> {
         tree.text += "\n";
         return Ok((tree, win));
     }
+    let web = apps::web_engine(&app.path) && ax::enable_web(app.pid);
     // An app's first accessibility pass settles its tree (SwiftUI moves focus into its content
     // as it is read); the original's first read already sees the settled tree.
     static WARMED: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
@@ -606,12 +636,15 @@ fn render(app: &apps::App) -> Result<(ax::Tree, Cf), String> {
     }
     ax::render(win.0, 0, usize::MAX, &mut tree);
     // Chromium and Firefox build their web trees lazily (first request, or after dropping it
-    // in the background): give it up to 3 s to show page content, and a nearly empty window too.
-    let web = apps::web_engine(&app.path) && ax::enable_web(app.pid);
+    // in the background): give it up to 3 s to show page content, and a nearly empty window too,
+    // until its count stops changing (Zed's window only ever shows a few elements).
+    let mut last = usize::MAX;
     for _ in 0..12 {
-        if (!web || tree.web_areas > 0) && tree.elems.len() >= 8 {
+        let n = tree.elems.len();
+        if (!web || tree.web_areas > 0) && (n >= 8 || n == last) {
             break;
         }
+        last = n;
         std::thread::sleep(std::time::Duration::from_millis(250));
         tree = ax::Tree::default();
         ax::render(win.0, 0, usize::MAX, &mut tree);

@@ -1,7 +1,11 @@
 //! App discovery: running apps (NSWorkspace) plus recently used apps (Spotlight metadata).
-use objc2_app_kit::{NSApplicationActivationPolicy, NSWorkspace};
+use objc2_app_kit::{NSApplicationActivationPolicy, NSRunningApplication, NSWorkspace};
 use objc2_foundation::{NSBundle, NSNumber, NSString};
 use std::process::Command;
+
+extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
 
 pub struct App {
     pub name: String,
@@ -15,19 +19,34 @@ fn s(v: Option<objc2::rc::Retained<NSString>>) -> String {
     v.map(|v| v.to_string()).unwrap_or_default()
 }
 
+fn app(a: &NSRunningApplication) -> App {
+    App {
+        name: s(a.localizedName()),
+        path: s(a.bundleURL().and_then(|u| u.path())),
+        bundle_id: s(a.bundleIdentifier()),
+        pid: a.processIdentifier(),
+        frontmost: a.isActive(),
+    }
+}
+
 pub fn running() -> Vec<App> {
     let ws = NSWorkspace::sharedWorkspace();
     ws.runningApplications()
         .iter()
         .filter(|a| a.activationPolicy() == NSApplicationActivationPolicy::Regular && a.bundleIdentifier().is_some())
-        .map(|a| App {
-            name: s(a.localizedName()),
-            path: s(a.bundleURL().and_then(|u| u.path())),
-            bundle_id: s(a.bundleIdentifier()),
-            pid: a.processIdentifier(),
-            frontmost: a.isActive(),
-        })
+        // The list can lag seconds behind launches and quits; leave out apps that have quit.
+        .filter(|a| unsafe { kill(a.processIdentifier(), 0) } == 0)
+        .map(|a| app(&a))
         .collect()
+}
+
+/// A running instance of the bundle at `path`. LaunchServices answers this at once, when
+/// NSWorkspace's list may not show an app for many seconds (Xcode, and others after it).
+fn running_at(id: &str, path: &str) -> Option<App> {
+    NSRunningApplication::runningApplicationsWithBundleIdentifier(&NSString::from_str(id)).iter()
+        .filter(|a| unsafe { kill(a.processIdentifier(), 0) } == 0)
+        .map(|a| app(&a))
+        .find(|a| a.path == path)
 }
 
 /// Apps whose web content needs an accessibility flag before it shows up: Chromium and
@@ -45,7 +64,10 @@ pub fn frontmost() -> Option<i32> {
 
 fn matches(a: &App, q: &str) -> bool {
     let q = q.trim_end_matches('/');
+    // The bundle's file name counts too: "Xcode-27.1.0" runs as "Xcode".
+    let file = std::path::Path::new(&a.path).file_stem().and_then(|f| f.to_str()).unwrap_or("");
     a.pid.to_string() == q || a.name.eq_ignore_ascii_case(q) || a.bundle_id.eq_ignore_ascii_case(q) || a.path == q
+        || file.eq_ignore_ascii_case(q)
 }
 
 /// Browsers, which get the original's browser notes and its stricter settable flags.
@@ -75,7 +97,9 @@ fn locate(q: &str) -> Option<String> {
     }
     let url = ws.URLForApplicationWithBundleIdentifier(&NSString::from_str(q));
     #[allow(deprecated)]
-    let path = url.and_then(|u| u.path()).or_else(|| ws.fullPathForApplication(&NSString::from_str(q)));
+    // A name with a dot ("Xcode-27.1.0") only resolves with its extension spelled out.
+    let path = url.and_then(|u| u.path()).or_else(|| ws.fullPathForApplication(&NSString::from_str(q)))
+        .or_else(|| ws.fullPathForApplication(&NSString::from_str(&format!("{q}.app"))));
     path.map(|p| p.to_string())
 }
 
@@ -89,10 +113,10 @@ pub fn resolve(q: &str) -> Result<App, String> {
     let id = found.as_ref().map(|a| a.bundle_id.clone()).or_else(|| {
         NSBundle::bundleWithPath(&NSString::from_str(&path)).and_then(|b| b.bundleIdentifier()).map(|s| s.to_string())
     });
-    if let Some(id) = id.filter(|id| BLOCKED.contains(&id.as_str())) {
+    if let Some(id) = id.as_ref().filter(|id| BLOCKED.contains(&id.as_str())) {
         return Err(format!("Computer Use is not allowed to use the app '{id}' for safety reasons."));
     }
-    if let Some(a) = found {
+    if let Some(a) = found.or_else(|| running_at(id.as_deref()?, &path)) {
         return Ok(a);
     }
     // An Electron host (Claude Code, T3 Code) leaks ELECTRON_RUN_AS_NODE, which `open` passes on
@@ -105,7 +129,7 @@ pub fn resolve(q: &str) -> Result<App, String> {
         .is_ok_and(|s| s.success());
     for _ in 0..50 {
         std::thread::sleep(std::time::Duration::from_millis(100));
-        if let Some(a) = running().into_iter().find(|a| ok && a.path == path) {
+        if let Some(a) = id.as_deref().filter(|_| ok).and_then(|id| running_at(id, &path)) {
             // The original waits for the app it launched to show a window.
             let root = crate::ax::app_element(a.pid);
             for _ in 0..50 {
@@ -113,7 +137,7 @@ pub fn resolve(q: &str) -> Result<App, String> {
                     // Electron apps activate themselves as their first window shows, whatever
                     // the launch asked for; hand the front back for as long as they keep trying.
                     let start = std::time::Instant::now();
-                    while start.elapsed() < std::time::Duration::from_secs(3) {
+                    while web_engine(&path) && start.elapsed() < std::time::Duration::from_secs(3) {
                         if frontmost() == Some(a.pid) {
                             #[allow(deprecated)]
                             before.as_ref().map(|b| b.activateWithOptions(objc2_app_kit::NSApplicationActivationOptions(0)));

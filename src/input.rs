@@ -108,6 +108,18 @@ pub(crate) fn post_other_event(pid: i32, ty: usize, subtype: i16, window: u32) {
     }
 }
 
+/// AppKit finishes some work only at the end of an event (NSDocument records an edit then), and
+/// an AX request isn't one. After an AX-only edit, a cmd+S deadlocks TextEdit inside its save.
+/// A flagsChanged with no modifiers held is an event every app takes and none acts on.
+pub fn end_event(pid: i32) {
+    let e = Cf(unsafe { CGEventCreateKeyboardEvent(std::ptr::null(), 0, true) });
+    unsafe {
+        CGEventSetType(e.0, 12);
+        CGEventSetFlags(e.0, 0);
+    }
+    send(pid, e.0);
+}
+
 /// A point-valued AX attribute such as AXActivationPoint.
 pub fn ax_point(e: *const c_void, name: &str) -> Option<Pt> {
     let v = crate::ax::attr(e, name)?;

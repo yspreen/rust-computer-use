@@ -138,10 +138,11 @@ fn markers(st: &Style) -> (String, String) {
         (false, true) => "*",
         _ => "",
     };
+    // Emphasis wraps the link (**[text](url)**), as the original prints Photos' footer link.
     let (mut open, mut close) = (em.to_string(), em.to_string());
     if let Some(url) = &st.link {
-        open.insert(0, '[');
-        close += &format!("]({})", ax::short_url(url));
+        open.push('[');
+        close.insert_str(0, &format!("]({})", ax::short_url(url)));
     }
     if st.strike {
         (open, close) = (format!("~~{open}"), format!("{close}~~"));

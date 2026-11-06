@@ -368,6 +368,22 @@ pub fn perform(e: AXRef, action: &str) -> Result<(), String> {
     }
 }
 
+/// The first element with this role, breadth first, at most `depth` levels down.
+pub fn find_role(e: AXRef, role: &str, depth: usize) -> Option<Cf> {
+    let mut level = vec![Cf(unsafe { CFRetain(e) })];
+    for _ in 0..depth {
+        let mut next = Vec::new();
+        for x in &level {
+            for c in children(x.0) {
+                if attr_str(c.0, "AXRole").as_deref() == Some(role) { return Some(c); }
+                next.push(c);
+            }
+        }
+        level = next;
+    }
+    None
+}
+
 /// Element frame in global screen points: (x, y, w, h).
 /// UIElementProtocol.clickablePoint(): the frame's midpoint, or None when the ancestors that
 /// clip it (scroll areas, groups with a scroll action, and the enclosing window, sheet, menu or
@@ -570,6 +586,8 @@ pub fn open_menu(app: AXRef) -> Option<Cf> {
 pub struct Tree {
     /// Web areas (AXWebArea) that have content, to tell when a browser has built its tree.
     pub web_areas: usize,
+    /// A web area whose page is still loading (AXLoaded off).
+    pub loading: bool,
     pub text: String,
     pub elems: Vec<Cf>,
     pub lines: Vec<String>,
@@ -1123,6 +1141,9 @@ fn shorten_urls(n: &mut Node) {
 fn emit(n: Node, depth: usize, tree: &mut Tree) {
     if n.role == "AXWebArea" && !n.children.is_empty() {
         tree.web_areas += 1;
+    }
+    if n.role == "AXWebArea" && attr(n.elem.0, "AXLoaded").is_some_and(|v| !to_bool(v.0)) {
+        tree.loading = true;
     }
     let line = n.line();
     // Something with nothing to say (a radio group) gives its place to its children.

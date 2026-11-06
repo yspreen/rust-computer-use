@@ -5,14 +5,35 @@ use crate::ax::{self, Cf};
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 pub const BROWSER: &str = "com.apple.Safari";
 
-/// (session, pid, window number)
-static OWNED: Mutex<Vec<(u64, i32, u32)>> = Mutex::new(Vec::new());
+/// (owner, pid, window number, last use). The owner is the session plus the name the window
+/// was opened under, so subagents sharing one connection can each have a window.
+type Owned = ((u64, String), i32, u32, Instant);
+static OWNED: Mutex<Vec<Owned>> = Mutex::new(Vec::new());
+
+/// A window its session hasn't used for this long closes: a client can keep a session open
+/// long after its agent is done (T3 child tasks do).
+const IDLE: Duration = Duration::from_secs(600);
 
 thread_local! {
     static SESSION: Cell<u64> = const { Cell::new(0) };
+    static NAME: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// The window name the current call asks for: "Safari#research" names "research".
+pub fn set_name(name: &str) {
+    NAME.with(|n| *n.borrow_mut() = name.to_string());
+}
+
+pub fn name() -> String {
+    NAME.with(|n| n.borrow().clone())
+}
+
+fn owner() -> (u64, String) {
+    (session(), name())
 }
 
 /// Each connection serves one session on its own thread.
@@ -25,17 +46,59 @@ fn session() -> u64 {
     SESSION.with(|s| s.get())
 }
 
-/// This session's window in the app, if it has one.
+/// This session's window in the app, if it has one; asking counts as using it.
 pub fn mine(pid: i32) -> Option<u32> {
-    OWNED.lock().unwrap().iter().find(|o| o.0 == session() && o.1 == pid).map(|o| o.2)
+    let mut owned = OWNED.lock().unwrap();
+    let o = owned.iter_mut().find(|o| o.0 == owner() && o.1 == pid)?;
+    o.3 = Instant::now();
+    Some(o.2)
 }
 
 fn others(pid: i32) -> Vec<u32> {
-    OWNED.lock().unwrap().iter().filter(|o| o.0 != session() && o.1 == pid).map(|o| o.2).collect()
+    OWNED.lock().unwrap().iter().filter(|o| o.0 != owner() && o.1 == pid).map(|o| o.2).collect()
+}
+
+/// The open agent windows are listed on disk, so a service that restarts (an update) closes
+/// the ones it no longer knows instead of leaving them open for good.
+fn record() -> std::path::PathBuf {
+    std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join("Library/Application Support/RustComputerUse/agent-windows")
+}
+
+fn save(owned: &[Owned]) {
+    let list: String = owned.iter().map(|o| format!("{} {}\n", o.1, o.2)).collect();
+    let _ = std::fs::create_dir_all(record().parent().unwrap());
+    let _ = std::fs::write(record(), list);
+}
+
+/// At service start: close the agent windows an earlier service left open.
+pub fn close_leftovers() {
+    let list = std::fs::read_to_string(record()).unwrap_or_default();
+    for (pid, id) in list.lines().filter_map(|l| l.split_once(' ')).filter_map(|(p, w)| Some((p.parse().ok()?, w.parse().ok()?))) {
+        close((pid, id));
+    }
+    let _ = std::fs::remove_file(record());
 }
 
 pub fn claim(pid: i32, window: u32) {
-    OWNED.lock().unwrap().push((session(), pid, window));
+    let mut owned = OWNED.lock().unwrap();
+    owned.push((owner(), pid, window, Instant::now()));
+    save(&owned);
+    drop(owned);
+    static SWEEPER: std::sync::Once = std::sync::Once::new();
+    SWEEPER.call_once(|| { std::thread::spawn(|| loop {
+        std::thread::sleep(Duration::from_secs(30));
+        // The record stays, so the session's next call says its window closed instead of
+        // quietly working in another one.
+        let idle: Vec<(i32, u32)> = OWNED.lock().unwrap().iter().filter(|o| o.3.elapsed() > IDLE).map(|o| (o.1, o.2)).collect();
+        idle.into_iter().for_each(close);
+    }); });
+}
+
+/// Close a window with its close button, which needs no activation.
+fn close((pid, id): (i32, u32)) {
+    if let Some(button) = find(pid, id).and_then(|w| ax::attr(w.0, "AXCloseButton")) {
+        let _ = ax::perform(button.0, "AXPress");
+    }
 }
 
 /// The app's AX window with this window number.
@@ -50,9 +113,14 @@ pub fn find(pid: i32, id: u32) -> Option<Cf> {
 pub fn pick(pid: i32) -> Result<Option<Cf>, String> {
     if let Some(id) = mine(pid) {
         return find(pid, id).map(Some).ok_or_else(|| {
-            OWNED.lock().unwrap().retain(|o| !(o.0 == session() && o.2 == id));
-            "Your browser window was closed. Call open_browser_window for a new one.".to_string()
+            let mut owned = OWNED.lock().unwrap();
+            owned.retain(|o| !(o.0 == owner() && o.2 == id));
+            save(&owned);
+            "Your browser window was closed (by hand, or after 10 minutes unused). Call open_browser_window for a new one.".to_string()
         });
+    }
+    if !name().is_empty() {
+        return Err(format!("There is no window named \"{}\" yet. Call open_browser_window with that name first.", name()));
     }
     let root = ax::app_element(pid);
     let taken = others(pid);
@@ -80,17 +148,14 @@ pub fn home(pid: i32) {
     }
 }
 
-/// When the session ends its windows close (their close button, which needs no activation).
+/// When the session ends its windows close.
 pub fn end_session() {
     let mine: Vec<(i32, u32)> = {
         let mut owned = OWNED.lock().unwrap();
-        let mine = owned.iter().filter(|o| o.0 == session()).map(|o| (o.1, o.2)).collect();
-        owned.retain(|o| o.0 != session());
+        let mine = owned.iter().filter(|o| o.0 .0 == session()).map(|o| (o.1, o.2)).collect();
+        owned.retain(|o| o.0 .0 != session());
+        save(&owned);
         mine
     };
-    for (pid, id) in mine {
-        if let Some(close) = find(pid, id).and_then(|w| ax::attr(w.0, "AXCloseButton")) {
-            let _ = ax::perform(close.0, "AXPress");
-        }
-    }
+    mine.into_iter().for_each(close);
 }

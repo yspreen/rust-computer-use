@@ -112,7 +112,7 @@ impl Io {
 struct Server {
     io: Io,
     /// Per app the last few states, newest last.
-    snaps: HashMap<i32, Vec<Snapshot>>,
+    snaps: HashMap<(i32, String), Vec<Snapshot>>,
     /// When the call being served arrived.
     received: std::time::Instant,
     enforcers: HashMap<i32, focus::Enforcer>,
@@ -150,6 +150,7 @@ fn main() {
     if service {
         std::thread::spawn(|| {
             warm_capture();
+            browser::close_leftovers();
             apps::list();
         });
         overlay::run(|| service::listen(serve))
@@ -250,7 +251,7 @@ fn tools() -> Value {
             json!({"app": app, "key": str_("Key or key combination to press")}), &["app", "key"]),
         tool("type_text", "Type literal text using keyboard input", json!({"app": app, "text": str_("Literal text to type")}), &["app", "text"]),
         // Not in the original.
-        tool("open_browser_window", "Get a Safari window that only this session uses, for web work across the whole session. Safari is the agents' browser, so logins made in it persist for later sessions. The window stays in the background: Safari is never brought to the front and no other agent's session sees or uses the window. Afterwards pass app \"Safari\" to the other tools to use it. Calling it again returns the same window. It closes when the session ends", json!({}), &[]),
+        tool("open_browser_window", "Get a Safari window that only this session uses, for web work across the whole session. It is a normal Safari window, not Private Browsing: Safari is the agents' browser, so it shows Safari's history and logins made in it persist for later sessions. The window stays in the background: Safari is never brought to the front and no other agent's session sees or uses the window. Afterwards pass app \"Safari\" to the other tools to use it. Calling it again returns the same window. It closes when the session ends or after 10 minutes unused; call this again for a new one. Subagents sharing one session each pass their own name and then use app \"Safari#<name>\"", json!({"name": str_("Optional window name, for several agents in one session (subagents): each name gets its own window, used with app \"Safari#<name>\"")}), &[]),
     ])
 }
 
@@ -344,9 +345,12 @@ fn call(srv: &mut Server, name: &str, a: &Value) -> Result<Value, String> {
         return Err("The Mac is locked. Unlock it before reading accessibility text.".into());
     }
     if name == "open_browser_window" {
+        browser::set_name(a["name"].as_str().unwrap_or("").trim());
         return open_browser(srv);
     }
-    let q = a["app"].as_str().unwrap_or("");
+    // "Safari#research" is the window this session opened under the name "research".
+    let (q, window_name) = a["app"].as_str().unwrap_or("").split_once('#').unwrap_or((a["app"].as_str().unwrap_or(""), ""));
+    browser::set_name(window_name.trim());
     let app = apps::resolve(q)?;
     if name == "get_app_state" {
         return state(&mut srv.snaps, &app, true);
@@ -355,7 +359,7 @@ fn call(srv: &mut Server, name: &str, a: &Value) -> Result<Value, String> {
     // Calls sent together (four set_values from one get_app_state) all mean that state, even
     // though the first one's answer renumbered the tree. Not in the original.
     let received = srv.received;
-    let snap = srv.snaps.get(&app.pid).and_then(|h| h.iter().rev().find(|s| s.taken < received).or(h.first()));
+    let snap = srv.snaps.get(&(app.pid, browser::name())).and_then(|h| h.iter().rev().find(|s| s.taken < received).or(h.first()));
     let Some(snap) = snap else {
         return Ok(text(format!("Computer Use is not active for '{q}'. You first must call `get_app_state` to get the latest state before doing other Computer Use actions. If `get_app_state` is not available in your environment, use `tool_search` to surface it.")));
     };
@@ -397,6 +401,16 @@ fn call(srv: &mut Server, name: &str, a: &Value) -> Result<Value, String> {
     if !srv.enforcers.contains_key(&app.pid) {
         srv.enforcers.insert(app.pid, focus::Enforcer::new(app.pid).map_err(server_err)?);
     }
+    // Return, a submitted address bar or a followed link may load a page: note the title first.
+    let indexed = || a["element_index"].as_str().and_then(|i| i.trim().parse::<usize>().ok()).and_then(|i| snap.tree.elems.get(i));
+    let navigating = match name {
+        "press_key" => a["key"].as_str().is_some_and(|k| k.to_lowercase().ends_with("return") || k.to_lowercase().ends_with("enter")),
+        "type_text" => a["text"].as_str().is_some_and(|t| t.contains('\n')),
+        "set_value" => indexed().is_some_and(submits),
+        "click" => indexed().is_some_and(|e| ax::attr_str(e.0, "AXRole").as_deref() == Some("AXLink") || ax::find_role(e.0, "AXLink", 3).is_some()),
+        _ => false,
+    } && (snap.tree.web_areas > 0 || apps::BROWSERS.contains(&app.bundle_id.as_str())); // Safari's Start Page has no web area
+    let title = navigating.then(|| browser::pick(app.pid).ok().flatten().and_then(|w| ax::attr_str(w.0, "AXTitle"))).flatten();
     let acted = act(snap, name, a, &app, &srv.enforcers[&app.pid]);
     HANDS_OFF.with(|h| h.set(false));
     input::end_event(app.pid);
@@ -410,6 +424,17 @@ fn call(srv: &mut Server, name: &str, a: &Value) -> Result<Value, String> {
     drop(acting);
     acted?;
     if !restore { settle(app.pid); }
+    // Settling can end before the page starts loading: give it up to 1.5 s to start (or the
+    // title to change); render then waits for the load. Not in the original.
+    if navigating {
+        if let Some(w) = browser::pick(app.pid).ok().flatten() {
+            let start = std::time::Instant::now();
+            while start.elapsed() < std::time::Duration::from_millis(1500) && ax::attr_str(w.0, "AXTitle") == title
+                && !ax::find_role(w.0, "AXWebArea", 8).is_some_and(|web| ax::attr(web.0, "AXLoaded").is_some_and(|v| !ax::to_bool(v.0))) {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    }
     state(&mut srv.snaps, &app, false).or_else(|e| {
         if e == server_err("appNotResponding") {
             return Err(e);
@@ -485,7 +510,8 @@ fn open_browser(srv: &mut Server) -> Result<Value, String> {
         browser::home(app.pid);
     }
     let mut out = state(&mut srv.snaps, &app, true)?;
-    let note = "This Safari window is yours for this session: pass app \"Safari\" to the other tools and they use it. No other session sees or uses it, and it closes when the session ends.";
+    let handle = match browser::name() { n if n.is_empty() => "Safari".to_string(), n => format!("Safari#{n}") };
+    let note = format!("This Safari window is yours: pass app \"{handle}\" to the other tools and they use it. No other agent sees or uses it, and it closes when the session ends or after 10 minutes unused.");
     out.as_array_mut().unwrap().insert(0, json!({"type": "text", "text": note}));
     Ok(out)
 }
@@ -612,6 +638,12 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App, enforcer: &focus
             let w = snap.window_id;
             if a.get("element_index").is_some() {
                 let e = &elem()?;
+                // A cell or group with nothing to press around the one link or button inside it
+                // (the tree merges them into one line) presses that. Not in the original.
+                let container = matches!(ax::attr_str(e.0, "AXRole").as_deref(), Some("AXCell" | "AXRow" | "AXGroup" | "AXStaticText" | "AXImage" | "AXListItem"));
+                let inner = (container && button == "left" && count == 1 && !ax::actions(e.0).iter().any(|(n, _)| n == "AXPress" || n == "AXPick"))
+                    .then(|| sole_pressable(e)).flatten();
+                let e = inner.as_ref().unwrap_or(e);
                 // The original's menu bar pre-step: make the app believe it is active and record
                 // the item's menu as open instead of pressing it, so nothing shows on screen.
                 if button == "left" && count == 1 && menu_of(e) {
@@ -730,10 +762,7 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App, enforcer: &focus
                 }
             }
             // Search fields and address bars are submitted with Return, as the original does.
-            let search = ax::attr_str(e.0, "AXSubrole").as_deref() == Some("AXSearchField")
-                || ax::attr_str(e.0, "AXIdentifier").as_deref() == Some("WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD")
-                || ax::attr_str(e.0, "AXKeyShortcutsValue").as_deref() == Some("⌘L");
-            if search {
+            if submits(e) {
                 enforce()?;
                 input::press("Return").map_err(|k| server_err(format!("keyNotFound(\"{k}\")")))?;
             }
@@ -852,6 +881,28 @@ fn scroll_bar(e: &Cf, dir: &str, pages: f64) -> Option<()> {
     let to = (now + sign * pages * seen / (1.0 - seen).max(0.01)).clamp(0.0, 1.0);
     let n = Cf(unsafe { core_foundation_sys::number::CFNumberCreate(std::ptr::null(), kCFNumberFloat64Type, &to as *const f64 as _) } as _);
     ax::set_attr(bar.0, "AXValue", n.0).ok()
+}
+
+/// Search fields and address bars, which set_value submits with Return as the original does.
+fn submits(e: &Cf) -> bool {
+    ax::attr_str(e.0, "AXSubrole").as_deref() == Some("AXSearchField")
+        || ax::attr_str(e.0, "AXIdentifier").as_deref() == Some("WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD")
+        || ax::attr_str(e.0, "AXKeyShortcutsValue").as_deref() == Some("⌘L")
+}
+
+/// The only element with AXPress within three levels below `e`, if exactly one has it.
+fn sole_pressable(e: &Cf) -> Option<Cf> {
+    let mut level = vec![Cf(unsafe { core_foundation_sys::base::CFRetain(e.0) })];
+    let mut found = Vec::new();
+    for _ in 0..3 {
+        let next: Vec<Cf> = level.iter().flat_map(|x| ax::attr(x.0, "AXChildren").map(|c| ax::elements(&c).into_iter()
+            .map(|k| Cf(unsafe { core_foundation_sys::base::CFRetain(k) })).collect::<Vec<_>>()).unwrap_or_default()).collect();
+        found.extend(next.iter().filter(|k| ax::actions(k.0).iter().any(|(n, _)| n == "AXPress"))
+            .map(|k| Cf(unsafe { core_foundation_sys::base::CFRetain(k.0) })));
+        if found.len() > 1 { return None; }
+        level = next;
+    }
+    found.pop()
 }
 
 /// The menu items of a pop-up button's menu, open or not (web pop-ups list them while closed).
@@ -1009,6 +1060,14 @@ fn render(app: &apps::App) -> Result<(ax::Tree, Cf), String> {
         tree = ax::Tree::default();
         ax::render(win.0, 0, usize::MAX, &mut tree);
     }
+    // A page still loading (a link just followed) is read once it has loaded, for at most 10 s;
+    // the tree of the page before it would otherwise come back. Not in the original.
+    let start = std::time::Instant::now();
+    while tree.loading && start.elapsed() < std::time::Duration::from_secs(10) {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        tree = ax::Tree::default();
+        ax::render(win.0, 0, usize::MAX, &mut tree);
+    }
     if let Some(bar) = ax::attr(root.0, "AXMenuBar") {
         ax::render(bar.0, 0, 1, &mut tree);
     }
@@ -1063,7 +1122,7 @@ fn instructions(app: &apps::App) -> Option<&'static str> {
 }
 
 /// get_app_state gets the full framing; actions get the shorter one.
-fn state(snaps: &mut HashMap<i32, Vec<Snapshot>>, app: &apps::App, full: bool) -> Result<Value, String> {
+fn state(snaps: &mut HashMap<(i32, String), Vec<Snapshot>>, app: &apps::App, full: bool) -> Result<Value, String> {
     let (tree, win) = render(app)?;
     let frame = ax::frame(win.0).ok_or(server_err("window has no frame"))?;
     // The AX window's own number; a frame match alone can pick a same-sized popup (Chrome's omnibox).
@@ -1105,7 +1164,7 @@ fn state(snaps: &mut HashMap<i32, Vec<Snapshot>>, app: &apps::App, full: bool) -
         }
         Some(Err(e)) => content.push(json!({"type": "text", "text": format!("Screenshot unavailable: {e}")})),
     }
-    let history = snaps.entry(app.pid).or_default();
+    let history = snaps.entry((app.pid, browser::name())).or_default();
     history.push(Snapshot { taken: std::time::Instant::now(), tree, window: frame, window_id, image });
     if history.len() > 8 { history.remove(0); }
     Ok(Value::Array(content))

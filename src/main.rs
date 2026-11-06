@@ -379,7 +379,7 @@ fn call(srv: &mut Server, name: &str, a: &Value) -> Result<Value, String> {
     // again afterwards. While the user is in the app that would move their focus, and AeroSpace
     // would follow it to the hidden workspace, so only actions that need no focus go ahead.
     let root = ax::app_element(app.pid);
-    let mut restore = None;
+    let mut restore = false;
     if let Some(own) = browser::mine(app.pid).and_then(|id| browser::find(app.pid, id)) {
         let key = ax::attr(root.0, "AXFocusedWindow");
         if key.as_ref().and_then(|k| ax::window_id(k.0)) != ax::window_id(own.0) {
@@ -389,7 +389,7 @@ fn call(srv: &mut Server, name: &str, a: &Value) -> Result<Value, String> {
                 HANDS_OFF.with(|h| h.set(true));
             } else {
                 let _ = ax::set_bool(own.0, "AXMain", true);
-                restore = key;
+                restore = true;
             }
         }
     }
@@ -400,13 +400,16 @@ fn call(srv: &mut Server, name: &str, a: &Value) -> Result<Value, String> {
     let acted = act(snap, name, a, &app, &srv.enforcers[&app.pid]);
     HANDS_OFF.with(|h| h.set(false));
     input::end_event(app.pid);
-    if let Some(key) = restore {
-        let _ = ax::set_bool(key.0, "AXMain", true);
+    // Actions answer with the resulting state once the UI settles, as the original does. The
+    // app takes in queued keys only then: making another window key any sooner redirects them,
+    // so a swapped key window is handed back after settling, still holding the action lock.
+    if restore {
+        if acted.is_ok() { settle(app.pid); } else { std::thread::sleep(std::time::Duration::from_millis(100)); }
+        browser::home(app.pid);
     }
     drop(acting);
     acted?;
-    // Actions answer with the resulting state once the UI settles, as the original does.
-    settle(app.pid);
+    if !restore { settle(app.pid); }
     state(&mut srv.snaps, &app, false).or_else(|e| {
         if e == server_err("appNotResponding") {
             return Err(e);
@@ -476,18 +479,10 @@ fn open_browser(srv: &mut Server) -> Result<Value, String> {
             ax::attr(root.0, "AXFocusedWindow").and_then(|w| ax::window_id(w.0)).filter(|id| !before.contains(id))
         }).ok_or(server_err("Safari didn't open a new window."))?;
         browser::claim(app.pid, new);
-        // AeroSpace takes a moment to register a new window; until then it rejects the move.
         if aerospace::running() {
-            let id = new.to_string();
-            (0..20).find(|_| {
-                let moved = aerospace::command(&["move-node-to-workspace", "--window-id", &id, AGENT_WORKSPACE]);
-                if !moved { std::thread::sleep(std::time::Duration::from_millis(50)); }
-                moved
-            });
+            aerospace::park(new, AGENT_WORKSPACE);
         }
-        if let Some(key) = key {
-            let _ = ax::set_bool(key.0, "AXMain", true);
-        }
+        browser::home(app.pid);
     }
     let mut out = state(&mut srv.snaps, &app, true)?;
     let note = "This Safari window is yours for this session: pass app \"Safari\" to the other tools and they use it. No other session sees or uses it, and it closes when the session ends.";
@@ -817,8 +812,16 @@ fn without_mouse(e: &Cf, button: &str, count: i64, at: Pt, enforce: &dyn Fn() ->
                 let _ = ax::set_bool(list.0, "AXFocused", true);
             }
             if count >= 2 {
-                enforce()?;
-                input::press("Return").map_err(server_err)?;
+                // Open it the way a double click does: AXOpen on the row's cell (file lists offer
+                // it), else Return once the selection has landed.
+                let open = |x: &Cf| ax::actions(x.0).iter().any(|(n, _)| n == "AXOpen") && ax::perform(x.0, "AXOpen").is_ok();
+                let cells = ax::attr(c.0, "AXChildren").map(|k| ax::elements(&k).into_iter()
+                    .map(|x| Cf(unsafe { core_foundation_sys::base::CFRetain(x) })).collect::<Vec<_>>()).unwrap_or_default();
+                if !open(e) && !cells.iter().any(open) {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    enforce()?;
+                    input::press("Return").map_err(server_err)?;
+                }
             }
             return Ok(());
         }

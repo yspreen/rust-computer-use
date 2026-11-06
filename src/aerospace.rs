@@ -11,9 +11,9 @@ pub fn running() -> bool {
     !NSRunningApplication::runningApplicationsWithBundleIdentifier(&NSString::from_str("bobko.aerospace")).is_empty()
 }
 
-/// Run one AeroSpace command; true when it exits 0.
-pub fn command(args: &[&str]) -> bool {
-    let run = || -> Option<bool> {
+/// Run one AeroSpace command: whether it exits 0, and what it prints.
+pub fn run(args: &[&str]) -> Option<(bool, String)> {
+    let run = || -> Option<(bool, String)> {
         let user = objc2_foundation::NSUserName().to_string();
         let mut s = UnixStream::connect(format!("/tmp/bobko.aerospace-{user}.sock")).ok()?;
         s.set_read_timeout(Some(std::time::Duration::from_secs(3))).ok()?;
@@ -26,9 +26,28 @@ pub fn command(args: &[&str]) -> bool {
         s.read_exact(&mut n).ok()?;
         let mut b = vec![0u8; u32::from_le_bytes(n) as usize];
         s.read_exact(&mut b).ok()?;
-        Some(serde_json::from_slice::<Value>(&b).ok()?["exitCode"] == 0)
+        let answer = serde_json::from_slice::<Value>(&b).ok()?;
+        Some((answer["exitCode"] == 0, answer["stdout"].as_str().unwrap_or("").to_string()))
     };
-    run().unwrap_or(false)
+    run()
+}
+
+pub fn command(args: &[&str]) -> bool {
+    run(args).is_some_and(|r| r.0)
+}
+
+/// Move a window to a workspace without following it. A config rule for new windows
+/// (on-window-detected) can move it back once AeroSpace registers it, so this checks for 2 s.
+pub fn park(window: u32, workspace: &str) {
+    let id = window.to_string();
+    let there = || run(&["list-windows", "--workspace", workspace, "--format", "%{window-id}"])
+        .is_some_and(|(_, out)| out.lines().any(|l| l.trim() == id));
+    let mut held = 0;
+    for _ in 0..20 {
+        if there() { held += 1; } else { held = 0; command(&["move-node-to-workspace", "--window-id", &id, workspace]); }
+        if held == 3 { return; }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 /// Turn window management off (every hidden window comes on screen) or back on (they return

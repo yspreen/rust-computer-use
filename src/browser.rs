@@ -70,6 +70,16 @@ pub fn pick(pid: i32) -> Result<Option<Cf>, String> {
     }
 }
 
+/// Make the app's first window no session owns its key window again (inside the app, without
+/// activating it), so the user finds their own window there.
+pub fn home(pid: i32) {
+    let owned: Vec<u32> = OWNED.lock().unwrap().iter().filter(|o| o.1 == pid).map(|o| o.2).collect();
+    let Some(all) = ax::attr(ax::app_element(pid).0, "AXWindows") else { return };
+    if let Some(&w) = ax::elements(&all).iter().find(|&&w| ax::window_id(w).is_some_and(|id| !owned.contains(&id))) {
+        let _ = ax::set_bool(w, "AXMain", true);
+    }
+}
+
 /// When the session ends its windows close (their close button, which needs no activation).
 pub fn end_session() {
     let mine: Vec<(i32, u32)> = {

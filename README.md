@@ -129,8 +129,9 @@ Safari window instead. It closes when the session ends. When AeroSpace runs, the
 window moves to a hidden workspace, `agents`, right after it opens.
 
 Safari has one key window, and keys go to it. Before each action the session's
-window is made key inside Safari, without activating Safari, and the previous
-key window is made key again afterwards. Should the user be in Safari, that
+window is made key inside Safari, without activating Safari. Once the app has
+settled (it takes in queued keys only then), the first window no agent owns is
+made key again. Should the user be in Safari, that
 would pull their focus away (and AeroSpace would follow it to the hidden
 workspace), so then only actions that need no focus run: reading state, clicking
 elements by index, `set_value` and scroll. Keys, typing and mouse clicks ask the

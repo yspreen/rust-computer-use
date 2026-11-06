@@ -2,6 +2,7 @@
 mod aerospace;
 mod apps;
 mod ax;
+mod browser;
 mod cursor;
 mod focus;
 mod input;
@@ -157,6 +158,7 @@ fn main() {
 }
 
 fn serve(input: Box<dyn BufRead + Send>, out: Box<dyn Write + Send>) {
+    browser::begin_session();
     let (tx, lines) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         for line in input.lines().map_while(Result::ok) {
@@ -200,6 +202,7 @@ fn serve(input: Box<dyn BufRead + Send>, out: Box<dyn Write + Send>) {
         srv.io.send(json!({"jsonrpc": "2.0", "id": id, "result": result}));
     }
     ax::restore_web();
+    browser::end_session();
     srv.enforcers.clear();
     let recorded: Vec<i32> = MENUS.lock().unwrap().iter().map(|m| m.0).collect();
     for pid in recorded { record_menu(pid, None); }
@@ -246,6 +249,8 @@ fn tools() -> Value {
         tool("press_key", "Press a key or key-combination on the keyboard, including modifier and navigation keys.\n  - This supports xdotool's `key` syntax.\n  - Examples: \"a\", \"Return\", \"Tab\", \"super+c\", \"Up\", \"KP_0\" (for the numpad 0 key).",
             json!({"app": app, "key": str_("Key or key combination to press")}), &["app", "key"]),
         tool("type_text", "Type literal text using keyboard input", json!({"app": app, "text": str_("Literal text to type")}), &["app", "text"]),
+        // Not in the original.
+        tool("open_browser_window", "Get a Safari window that only this session uses, for web work across the whole session. Safari is the agents' browser, so logins made in it persist for later sessions. The window stays in the background: Safari is never brought to the front and no other agent's session sees or uses the window. Afterwards pass app \"Safari\" to the other tools to use it. Calling it again returns the same window. It closes when the session ends", json!({}), &[]),
     ])
 }
 
@@ -259,6 +264,17 @@ fn advertised() -> Value {
         d += ". As a last resort, for a window on a hidden AeroSpace workspace, AeroSpace is switched off for about a second so the click lands, which briefly shows the user every hidden window";
     }
     click["description"] = json!(d + ".");
+    let list = t.as_array_mut().unwrap();
+    if apps::installed(browser::BROWSER) {
+        let open = list.iter_mut().find(|t| t["name"] == "open_browser_window").unwrap();
+        let mut d = open["description"].as_str().unwrap_or("").to_string();
+        if aerospace::running() {
+            d += &format!(". It is kept on the hidden AeroSpace workspace \"{AGENT_WORKSPACE}\", off screen");
+        }
+        open["description"] = json!(d);
+    } else {
+        list.retain(|t| t["name"] != "open_browser_window");
+    }
     t
 }
 
@@ -327,6 +343,9 @@ fn call(srv: &mut Server, name: &str, a: &Value) -> Result<Value, String> {
     if screen_locked() {
         return Err("The Mac is locked. Unlock it before reading accessibility text.".into());
     }
+    if name == "open_browser_window" {
+        return open_browser(srv);
+    }
     let q = a["app"].as_str().unwrap_or("");
     let app = apps::resolve(q)?;
     if name == "get_app_state" {
@@ -347,22 +366,43 @@ fn call(srv: &mut Server, name: &str, a: &Value) -> Result<Value, String> {
         if !wait.is_zero() {
             return Err(format!("The user is still interacting with '{}'. Wait {} seconds and retry.", app.name, wait.as_secs_f64().ceil()));
         }
-        if t > snap.taken {
+        if t > snap.taken && browser::mine(app.pid).is_none() {
             return Err(format!("The user changed '{}'. Re-query the latest state with `get_app_state` before sending more actions.", app.name));
         }
     }
     if !ax::responsive(app.pid) {
         return Err(server_err("appNotResponding"));
     }
-    // Sessions share the service, and input's target with it: one action at a time.
-    static ACTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let acting = ACTING.lock().unwrap();
+    // A session's own browser window becomes the app's key window for the action (keys go to
+    // the key window), inside the app and without activating it; the user's window is key
+    // again afterwards. While the user is in the app that would move their focus, and AeroSpace
+    // would follow it to the hidden workspace, so only actions that need no focus go ahead.
+    let root = ax::app_element(app.pid);
+    let mut restore = None;
+    if let Some(own) = browser::mine(app.pid).and_then(|id| browser::find(app.pid, id)) {
+        let key = ax::attr(root.0, "AXFocusedWindow");
+        if key.as_ref().and_then(|k| ax::window_id(k.0)) != ax::window_id(own.0) {
+            // Either the process taking the user's keystrokes or the frontmost app (which
+            // AeroSpace follows); the two disagree at times, such as while a system alert shows.
+            if preventer::key_focus() == Some(app.pid) || apps::frontmost() == Some(app.pid) {
+                HANDS_OFF.with(|h| h.set(true));
+            } else {
+                let _ = ax::set_bool(own.0, "AXMain", true);
+                restore = key;
+            }
+        }
+    }
     input::target(app.pid, snap.window_id, Pt { x: snap.window.0, y: snap.window.1 });
     if !srv.enforcers.contains_key(&app.pid) {
         srv.enforcers.insert(app.pid, focus::Enforcer::new(app.pid).map_err(server_err)?);
     }
     let acted = act(snap, name, a, &app, &srv.enforcers[&app.pid]);
+    HANDS_OFF.with(|h| h.set(false));
     input::end_event(app.pid);
+    if let Some(key) = restore {
+        let _ = ax::set_bool(key.0, "AXMain", true);
+    }
     drop(acting);
     acted?;
     // Actions answer with the resulting state once the UI settles, as the original does.
@@ -383,6 +423,80 @@ fn call(srv: &mut Server, name: &str, a: &Value) -> Result<Value, String> {
         Ok(text("Action completed. Call `get_app_state` to fetch the updated UI state."))
     })
 }
+
+/// Sessions share the service, and input's target with it: one action at a time.
+static ACTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+thread_local! {
+    /// Set while acting in a session's own browser window as the user works in the same app:
+    /// anything that would make that window key (keys, mouse clicks) has to wait.
+    static HANDS_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn hands_off(app: &apps::App) -> Result<(), String> {
+    if !HANDS_OFF.with(|h| h.get()) { return Ok(()); }
+    Err(format!("The user is using {} right now, and this needs your window to take its keyboard focus, which would pull theirs away. Wait a few seconds and retry. Reading state, clicking elements by index, set_value and scroll work meanwhile.", app.name))
+}
+
+/// open_browser_window: a new Safari window (the agents' browser, so logins persist), made
+/// with super+n while Safari stays in the back, then moved to a hidden AeroSpace workspace
+/// when AeroSpace runs, and kept for this session. Not in the original.
+fn open_browser(srv: &mut Server) -> Result<Value, String> {
+    let app = apps::resolve(browser::BROWSER)?;
+    if browser::mine(app.pid).and_then(|id| browser::find(app.pid, id)).is_none() {
+        let root = ax::app_element(app.pid);
+        // A browser that just launched is still opening its own first window: wait until its
+        // window count holds for 0.5 s (at most 3 s), so that one isn't taken for the new one.
+        let count = || ax::attr(root.0, "AXWindows").map_or(0, |w| ax::elements(&w).len());
+        let (mut last, mut since) = (count(), std::time::Instant::now());
+        let start = std::time::Instant::now();
+        while since.elapsed() < std::time::Duration::from_millis(500) && start.elapsed() < std::time::Duration::from_secs(3) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if count() != last { (last, since) = (count(), std::time::Instant::now()); }
+        }
+        let before: Vec<u32> = windows(app.pid, false).into_iter().map(|w| w.0).collect();
+        let key = ax::attr(root.0, "AXFocusedWindow");
+        {
+            let _acting = ACTING.lock().unwrap();
+            let frame = key.as_ref().and_then(|k| ax::frame(k.0)).unwrap_or_default();
+            input::target(app.pid, key.as_ref().and_then(|k| ax::window_id(k.0)).unwrap_or(0), Pt { x: frame.0, y: frame.1 });
+            if !srv.enforcers.contains_key(&app.pid) {
+                srv.enforcers.insert(app.pid, focus::Enforcer::new(app.pid).map_err(server_err)?);
+            }
+            let enforcer = &srv.enforcers[&app.pid];
+            if !enforcer.believes_focus() {
+                enforcer.enforce(key.as_ref().and_then(|k| input::ax_point(k.0, "AXActivationPoint"))).map_err(server_err)?;
+            }
+            input::press("super+n").map_err(server_err)?;
+            input::end_event(app.pid);
+        }
+        let new = (0..60).find_map(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            // The new window is the one super+n made key.
+            ax::attr(root.0, "AXFocusedWindow").and_then(|w| ax::window_id(w.0)).filter(|id| !before.contains(id))
+        }).ok_or(server_err("Safari didn't open a new window."))?;
+        browser::claim(app.pid, new);
+        // AeroSpace takes a moment to register a new window; until then it rejects the move.
+        if aerospace::running() {
+            let id = new.to_string();
+            (0..20).find(|_| {
+                let moved = aerospace::command(&["move-node-to-workspace", "--window-id", &id, AGENT_WORKSPACE]);
+                if !moved { std::thread::sleep(std::time::Duration::from_millis(50)); }
+                moved
+            });
+        }
+        if let Some(key) = key {
+            let _ = ax::set_bool(key.0, "AXMain", true);
+        }
+    }
+    let mut out = state(&mut srv.snaps, &app, true)?;
+    let note = "This Safari window is yours for this session: pass app \"Safari\" to the other tools and they use it. No other session sees or uses it, and it closes when the session ends.";
+    out.as_array_mut().unwrap().insert(0, json!({"type": "text", "text": note}));
+    Ok(out)
+}
+
+/// The hidden AeroSpace workspace agents' browser windows live on.
+const AGENT_WORKSPACE: &str = "agents";
 
 /// The menu the original treats as open per app: a menu bar item it "clicked" without pressing
 /// it (the controller's open-menu box), so the real menu never appears on screen.
@@ -441,11 +555,12 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App, enforcer: &focus
     // The original's focus enforcer: whenever the app no longer believes it has focus, it is
     // made to believe so with the user's app kept in front and the screen frozen.
     let enforce = || -> Result<(), String> {
+        hands_off(app)?;
         if enforcer.believes_focus() {
             return Ok(());
         }
         input::set_mouse_flags(0);
-        let win = ax::window(ax::app_element(app.pid).0);
+        let win = browser::pick(app.pid).ok().flatten();
         let point = win.and_then(|w| input::ax_point(w.0, "AXActivationPoint"));
         enforcer.enforce(point).map_err(server_err)?;
         Ok(())
@@ -453,6 +568,7 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App, enforcer: &focus
     // Rule B of the original's sendClick: activate only for clicks inside web views or on text
     // that may get selected; other clicks carry Command so AppKit leaves the app in the back.
     let prepare_click = |el: Option<&Cf>, at: Pt| -> Result<(), String> {
+        hands_off(app)?;
         let hit = ax::element_at(app.pid, at.x, at.y);
         let web = el.or(hit.as_ref()).is_some_and(|e| ax::in_web_view(e.0));
         if enforcer.believes_focus() {
@@ -474,6 +590,7 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App, enforcer: &focus
             // fallback can't click: switch AeroSpace off so the window comes on screen, click
             // where the point moved to, switch it back on. Every hidden window shows for a moment.
             let reveal = |at: Pt, hover: bool| -> Result<(), String> {
+                hands_off(app)?;
                 let bounds = || windows(app.pid, false).into_iter().find(|w| w.0 == snap.window_id).map(|w| w.1);
                 if !aerospace::enable(false) { return visible(at); }
                 let mut done = Err(server_err("AeroSpace was switched off, but the window didn't come on screen."));
@@ -844,7 +961,7 @@ fn render(app: &apps::App) -> Result<(ax::Tree, Cf), String> {
     let root = ax::app_element(app.pid);
     // A running app without windows gets the reopen event a Dock click sends (the original
     // opens it again with an Apple event, without activating), then up to 5 s to show one.
-    let win = match ax::window(root.0) {
+    let win = match browser::pick(app.pid)? {
         Some(w) => w,
         None => {
             let _ = std::process::Command::new("/usr/bin/open").args(["-g", "-a", &app.path])

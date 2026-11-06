@@ -104,6 +104,11 @@ fn locate(q: &str) -> Option<String> {
 }
 
 /// Find a running app by name, path, or bundle id, launching it in the background if needed.
+/// Whether an app with this bundle identifier is installed.
+pub fn installed(id: &str) -> bool {
+    NSWorkspace::sharedWorkspace().URLForApplicationWithBundleIdentifier(&NSString::from_str(id)).is_some()
+}
+
 pub fn resolve(q: &str) -> Result<App, String> {
     let found = running().into_iter().find(|a| matches(a, q));
     let path = match &found {

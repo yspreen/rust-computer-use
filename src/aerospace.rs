@@ -12,7 +12,7 @@ pub fn running() -> bool {
 }
 
 /// Run one AeroSpace command; true when it exits 0.
-fn command(args: &[&str]) -> bool {
+pub fn command(args: &[&str]) -> bool {
     let run = || -> Option<bool> {
         let user = objc2_foundation::NSUserName().to_string();
         let mut s = UnixStream::connect(format!("/tmp/bobko.aerospace-{user}.sock")).ok()?;

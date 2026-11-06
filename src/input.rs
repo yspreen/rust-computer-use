@@ -9,6 +9,8 @@ use std::{thread::sleep, time::Duration};
 // Events go to one process and window, never through the global HID tap, so the
 // target app stays in the background and the user's cursor and focus are untouched.
 static PID: AtomicI32 = AtomicI32::new(0);
+/// Where key events go: the target app, or the process drawing its focused window's content.
+static KEY_PID: AtomicI32 = AtomicI32::new(0);
 static WINDOW: AtomicU32 = AtomicU32::new(0);
 static ORIGIN: Mutex<Pt> = Mutex::new(Pt { x: 0.0, y: 0.0 });
 /// Flags added to every mouse event: Command for a click on an app that doesn't believe it
@@ -130,6 +132,7 @@ pub fn ax_point(e: *const c_void, name: &str) -> Option<Pt> {
 /// `origin` is the window's top-left corner in global points.
 pub fn target(pid: i32, window: u32, origin: Pt) {
     PID.store(pid, Relaxed);
+    KEY_PID.store(crate::key_pid(pid), Relaxed);
     WINDOW.store(window, Relaxed);
     *ORIGIN.lock().unwrap() = origin;
 }
@@ -138,6 +141,17 @@ pub fn target(pid: i32, window: u32, origin: Pt) {
 fn post(e: Ev) {
     let e = Cf(e);
     send(PID.load(Relaxed), e.0);
+}
+
+/// Whether the target window's content is drawn by another process (a sandboxed app's open
+/// panel). Such content takes keys but no synthesized mouse events.
+pub fn remote() -> bool {
+    KEY_PID.load(Relaxed) != PID.load(Relaxed)
+}
+
+fn post_key(e: Ev) {
+    let e = Cf(e);
+    send(KEY_PID.load(Relaxed), e.0);
 }
 
 fn pause(ms: u64) {
@@ -258,7 +272,7 @@ fn key_event(code: u16, flags: u64, text: Option<&[u16]>) {
             CGEventSetType(e, 12);
             CGEventSetFlags(e, f);
         }
-        post(e);
+        post_key(e);
     };
     if flags != 0 {
         flags_changed(flags);
@@ -269,7 +283,7 @@ fn key_event(code: u16, flags: u64, text: Option<&[u16]>) {
         if let Some(t) = text {
             unsafe { CGEventKeyboardSetUnicodeString(e, t.len(), t.as_ptr()) };
         }
-        post(e);
+        post_key(e);
     }
     if flags != 0 {
         flags_changed(0);

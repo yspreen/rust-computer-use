@@ -100,8 +100,12 @@ seconds. Your real pointer never moves.
   `type_text` sends key events from the current layout across eight
   shift/option/control combinations. Characters no key produces are sent as
   unicode events rather than dropped.
-- **Scroll:** one continuous pixel event of pages times the element's height or
-  width.
+- **Open and save panels:** in sandboxed apps (Safari's file upload, TextEdit's
+  Open) an XPC service the app is responsible for draws the panel, in a hidden
+  copy of the app's window. Keys go to that service, as the original sends them.
+  Keys sent to the app itself only beep.
+- **Scroll:** one continuous pixel event of pages times the element's visible
+  height or width.
 - **After an action:** the app gets a flagsChanged event with no modifiers, so
   AppKit finishes what it does at the end of an event (TextEdit deadlocks in a
   later save otherwise). Then the state is read once the app's AX notifications
@@ -121,6 +125,32 @@ seconds. Your real pointer never moves.
   shadow instead.
 - `set_value` on a Finder file name fails, and puts the real name back on screen,
   when the file wasn't renamed. The original reports success.
+- A page of `scroll` is what's visible of the element. The original uses the
+  element's whole frame, which for a web area is the whole document, so 0.25
+  pages of a long page jumped a third of the way down.
+- Calls sent together (several `set_value`s from one `get_app_state`) resolve
+  element indices and pixels against the state the client had when it sent
+  them. In the original the first call's result renumbers the tree, and the
+  next call hits a different element.
+- `set_value` on a pop-up button (a native `<select>`) picks the option with
+  that title and checks that the button shows it. The original refuses, as the
+  button isn't settable. Clicking an item in a pop-up's menu that doesn't change
+  the pop-up is an error, where the original reports success.
+- Two places take no synthesized mouse events: windows off every display (a
+  window manager's hidden workspace), where AppKit hit-tests them at the
+  display's edge, and sandboxed apps' open and save panels, drawn by another
+  process. Clicks there, by element or by pixel, go through accessibility: a row
+  gets selected (a double click then opens it with Return), a field gets focus,
+  and anything else is an error instead of a click somewhere else. Off-display
+  scrolls move the scroll bar. Web content is exempt, as WebKit still takes
+  those events. The click tool's description and the off-screen note name these
+  fallbacks as a second choice after element actions.
+- When [AeroSpace](https://github.com/nikitabobko/AeroSpace) is running, a pixel
+  click on an off-display window that the accessibility fallback can't do
+  switches AeroSpace off through its socket, clicks where the window came on
+  screen, and switches it back on (about 1.3 s; every hidden window shows
+  briefly). Workspace assignments stay as they were. Without AeroSpace, nothing
+  of this is advertised or done.
 - Not reproduced: the URL blocklist (fetched from OpenAI), the lock-screen
   unlock helper, and the original's non-tool features (appshots, recording,
   Messages).

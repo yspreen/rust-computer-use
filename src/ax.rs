@@ -383,10 +383,16 @@ pub fn clickable_point(e: AXRef) -> Option<(f64, f64)> {
 /// Middle of the part of the element its clipping ancestors leave visible (a tall table's
 /// frame reaches far past its scroll area).
 pub fn visible_center(e: AXRef) -> Option<(f64, f64)> {
+    visible_frame(e).map(|(x, y, w, h)| (x + w / 2.0, y + h / 2.0))
+}
+
+/// The part of the element its clipping ancestors leave visible, as (x, y, w, h). A web area's
+/// frame is the whole document; this is the viewport.
+pub fn visible_frame(e: AXRef) -> Option<(f64, f64, f64, f64)> {
     let (x, y, w, h) = frame(e)?;
     let v = clip(e)?;
     let (x0, y0, x1, y1) = (x.max(v.0), y.max(v.1), (x + w).min(v.2), (y + h).min(v.3));
-    (x0 < x1 && y0 < y1).then(|| ((x0 + x1) / 2.0, (y0 + y1) / 2.0))
+    (x0 < x1 && y0 < y1).then_some((x0, y0, x1 - x0, y1 - y0))
 }
 
 /// The visible rect (x0, y0, x1, y1) the element's clipping ancestors (scroll areas, groups
@@ -419,7 +425,7 @@ fn children(e: AXRef) -> Vec<Cf> {
     attr(e, "AXChildren").map(|v| array(&v).iter().map(|&c| Cf(unsafe { CFRetain(c) })).collect()).unwrap_or_default()
 }
 
-fn number(v: CFTypeRef) -> Option<f64> {
+pub fn number(v: CFTypeRef) -> Option<f64> {
     let mut f = 0f64;
     (unsafe { CFGetTypeID(v) == CFNumberGetTypeID() && CFNumberGetValue(v as _, kCFNumberFloat64Type, &mut f as *mut f64 as _) }).then_some(f)
 }
@@ -666,6 +672,10 @@ fn fetch(e: AXRef, depth: usize, max_depth: usize, budget: &mut usize, browser: 
         return None;
     }
     let children_raw = if depth < max_depth { kids(16) } else { vec![] };
+    // A menu drawn by another process (a pop-up in a sandboxed app's open panel) answers this
+    // batched read with no children, though it lists them when asked for them alone.
+    let single = (children_raw.is_empty() && depth < max_depth && role == "AXMenu").then(|| attr(e, "AXChildren")).flatten();
+    let children_raw = match single.as_ref() { Some(c) => elements(c), None => children_raw };
     // The original's visibleElementsCalculatingSubset: 100 or more children are read as far as
     // an element that lists AXVisibleChildren calls them visible, at most 500. A run of
     // consecutive children reads as that run, noted as a subset (Photos' grid); anything else

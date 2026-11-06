@@ -1,4 +1,5 @@
 //! Clean-room MCP stdio server exposing the Codex Computer Use tool interface on macOS.
+mod aerospace;
 mod apps;
 mod ax;
 mod cursor;
@@ -74,17 +75,29 @@ fn on_display(f: (f64, f64, f64, f64)) -> f64 {
     seen / (f.2 * f.3).max(1.0)
 }
 
-/// JSON-RPC, one message per line.
+/// Whether a global point is on some display. AppKit hit-tests mouse events elsewhere at the
+/// display's edge.
+fn shown(p: Pt) -> bool {
+    on_display((p.x, p.y, 1.0, 1.0)) > 0.0
+}
+
+fn visible(p: Pt) -> Result<(), String> {
+    shown(p).then_some(()).ok_or_else(|| server_err("The window is outside every display, so a click or drag at its pixels would land somewhere else. Use element actions (click by element_index, set_value, perform_secondary_action) or keys, or ask the user to bring the window on screen."))
+}
+
+/// JSON-RPC, one message per line, each with the time it arrived: calls the client sent
+/// together queue up while the first runs.
 struct Io {
-    lines: std::io::Lines<Box<dyn BufRead + Send>>,
+    lines: std::sync::mpsc::Receiver<(std::time::Instant, String)>,
     out: Box<dyn Write + Send>,
 }
 
 impl Io {
-    fn next(&mut self) -> Option<Value> {
+    fn next(&mut self) -> Option<(std::time::Instant, Value)> {
         loop {
-            if let Ok(m) = serde_json::from_str(&self.lines.next()?.ok()?) {
-                return Some(m);
+            let (at, line) = self.lines.recv().ok()?;
+            if let Ok(m) = serde_json::from_str(&line) {
+                return Some((at, m));
             }
         }
     }
@@ -97,7 +110,10 @@ impl Io {
 
 struct Server {
     io: Io,
-    snaps: HashMap<i32, Snapshot>,
+    /// Per app the last few states, newest last.
+    snaps: HashMap<i32, Vec<Snapshot>>,
+    /// When the call being served arrived.
+    received: std::time::Instant,
     enforcers: HashMap<i32, focus::Enforcer>,
 }
 
@@ -141,12 +157,20 @@ fn main() {
 }
 
 fn serve(input: Box<dyn BufRead + Send>, out: Box<dyn Write + Send>) {
+    let (tx, lines) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in input.lines().map_while(Result::ok) {
+            if tx.send((std::time::Instant::now(), line)).is_err() { break; }
+        }
+    });
     let mut srv = Server {
-        io: Io { lines: input.lines(), out },
+        io: Io { lines, out },
         snaps: HashMap::new(),
+        received: std::time::Instant::now(),
         enforcers: HashMap::new(),
     };
-    while let Some(msg) = srv.io.next() {
+    while let Some((received, msg)) = srv.io.next() {
+        srv.received = received;
         let Some(id) = msg.get("id").cloned().filter(|_| msg.get("method").is_some()) else {
             continue; // notifications and stray replies need no answer
         };
@@ -158,7 +182,7 @@ fn serve(input: Box<dyn BufRead + Send>, out: Box<dyn Write + Send>) {
                     "serverInfo": {"name": "rust-computer-use", "version": env!("CARGO_PKG_VERSION")},
                 })
             }
-            "tools/list" => json!({"tools": tools()}),
+            "tools/list" => json!({"tools": advertised()}),
             "tools/call" => {
                 let (name, args) = (msg["params"]["name"].as_str().unwrap_or(""), &msg["params"]["arguments"]);
                 match call(&mut srv, name, args) {
@@ -223,6 +247,19 @@ fn tools() -> Value {
             json!({"app": app, "key": str_("Key or key combination to press")}), &["app", "key"]),
         tool("type_text", "Type literal text using keyboard input", json!({"app": app, "text": str_("Literal text to type")}), &["app", "text"]),
     ])
+}
+
+/// The tools as listed, with the click fallbacks named as second choices. Not in the original.
+fn advertised() -> Value {
+    let mut t = tools();
+    let click = t.as_array_mut().unwrap().iter_mut().find(|t| t["name"] == "click").unwrap();
+    let mut d = click["description"].as_str().unwrap_or("").to_string();
+    d += ". Prefer element_index. Where synthesized clicks can't land (a window outside every display, or a sandboxed app's open or save panel), a click falls back to accessibility as a second choice: it selects a row (a double click opens it) or focuses a field";
+    if aerospace::running() {
+        d += ". As a last resort, for a window on a hidden AeroSpace workspace, AeroSpace is switched off for about a second so the click lands, which briefly shows the user every hidden window";
+    }
+    click["description"] = json!(d + ".");
+    t
 }
 
 fn text(s: impl Into<String>) -> Value {
@@ -295,7 +332,12 @@ fn call(srv: &mut Server, name: &str, a: &Value) -> Result<Value, String> {
     if name == "get_app_state" {
         return state(&mut srv.snaps, &app, true);
     }
-    let Some(snap) = srv.snaps.get(&app.pid) else {
+    // Element indices and pixels refer to the newest state the client had when it sent the call.
+    // Calls sent together (four set_values from one get_app_state) all mean that state, even
+    // though the first one's answer renumbered the tree. Not in the original.
+    let received = srv.received;
+    let snap = srv.snaps.get(&app.pid).and_then(|h| h.iter().rev().find(|s| s.taken < received).or(h.first()));
+    let Some(snap) = snap else {
         return Ok(text(format!("Computer Use is not active for '{q}'. You first must call `get_app_state` to get the latest state before doing other Computer Use actions. If `get_app_state` is not available in your environment, use `tool_search` to surface it.")));
     };
     // Like the original, refuse to act while the user is using the app, and after they used it
@@ -428,6 +470,32 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App, enforcer: &focus
         "click" => {
             let button = a["mouse_button"].as_str().unwrap_or("left");
             let count = a["click_count"].as_i64().unwrap_or(1);
+            // Last resort for a window on a hidden AeroSpace workspace that the accessibility
+            // fallback can't click: switch AeroSpace off so the window comes on screen, click
+            // where the point moved to, switch it back on. Every hidden window shows for a moment.
+            let reveal = |at: Pt, hover: bool| -> Result<(), String> {
+                let bounds = || windows(app.pid, false).into_iter().find(|w| w.0 == snap.window_id).map(|w| w.1);
+                if !aerospace::enable(false) { return visible(at); }
+                let mut done = Err(server_err("AeroSpace was switched off, but the window didn't come on screen."));
+                for _ in 0..20 {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    if let Some(b) = bounds().filter(|&b| on_display(b) > 0.5) {
+                        let p = Pt { x: at.x - snap.window.0 + b.0, y: at.y - snap.window.1 + b.1 };
+                        input::target(app.pid, snap.window_id, Pt { x: b.0, y: b.1 });
+                        done = prepare_click(None, p).map(|_| {
+                            cursor::move_to(p, snap.window_id);
+                            click_with_cursor(p, button, count, hover);
+                            std::thread::sleep(std::time::Duration::from_millis(150)); // let it land
+                        });
+                        break;
+                    }
+                }
+                aerospace::enable(true);
+                done
+            };
+            let fallback = |e: &Cf, at: Pt, hover: bool| without_mouse(e, button, count, at, &enforce).or_else(|err| {
+                if !shown(at) && !input::remote() && aerospace::running() { reveal(at, hover) } else { Err(err) }
+            });
             // The cursor glides to the spot first; the click goes out once it is close enough.
             let w = snap.window_id;
             if a.get("element_index").is_some() {
@@ -450,11 +518,18 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App, enforcer: &focus
                 let press = button == "left" && count == 1 && !(ax::in_web_view(e.0) && ax::contains_hit(e.0, app.pid, at));
                 if press && action.is_some() && catalyst && !enforcer.believes_focus()
                     && (ax::may_select(e.0) || ax::attr_str(e.0, "AXRole").as_deref() == Some("AXMenuButton")) { enforce()?; }
+                let popup = popup_of(e).map(|p| (ax::attr_str(p.0, "AXValue"), p));
                 if press && action.is_some_and(|a| ax::perform(e.0, a).is_ok()) {
                     cursor::press(1);
-                    return Ok(());
+                    return match popup {
+                        Some((before, p)) => chosen(&p, &ax::attr_str(e.0, "AXTitle").unwrap_or_default(), before),
+                        None => Ok(()),
+                    };
                 }
                 let at = point.ok_or(server_err("cannotClickOffscreenElement"))?;
+                if !ax::in_web_view(e.0) && (!shown(at) || input::remote()) {
+                    return fallback(e, at, false);
+                }
                 prepare_click(Some(e), at)?;
                 click_with_cursor(at, button, count, false);
             } else {
@@ -463,6 +538,19 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App, enforcer: &focus
                 if !windows(app.pid, true).into_iter().any(|(_, b)| inside(b)) && !inside(snap.window) {
                     return Err(server_err(format!("windowNotFoundAtPosition(({:?}, {:?}))", at.x, at.y)));
                 }
+                if !shown(at) || input::remote() {
+                    // The smallest element of the last tree whose frame holds the point:
+                    // hit-testing off every display gives the window, or nothing.
+                    let inside = |e: &&Cf| ax::frame(e.0).filter(|&(x, y, w, h)| at.x >= x && at.x < x + w && at.y >= y && at.y < y + h).map(|f| f.2 * f.3);
+                    let from_tree = || snap.tree.elems.iter().filter_map(|e| inside(&e).map(|a| (a, e))).min_by(|a, b| a.0.total_cmp(&b.0))
+                        .map(|(_, e)| Cf(unsafe { core_foundation_sys::base::CFRetain(e.0) }));
+                    match from_tree().or_else(|| ax::element_at(app.pid, at.x, at.y)) {
+                        Some(h) if ax::in_web_view(h.0) => {}
+                        Some(h) => return fallback(&h, at, true),
+                        None if aerospace::running() && !input::remote() => return reveal(at, true),
+                        None => visible(at)?,
+                    }
+                }
                 cursor::move_to(at, w);
                 prepare_click(None, at)?;
                 click_with_cursor(at, button, count, true);
@@ -470,6 +558,8 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App, enforcer: &focus
         }
         "drag" => {
             let (from, to) = (to_screen(f("from_x")?, f("from_y")?), to_screen(f("to_x")?, f("to_y")?));
+            visible(from)?;
+            visible(to)?;
             cursor::move_to(from, snap.window_id);
             prepare_click(None, from)?;
             input::drag(from, to);
@@ -502,6 +592,9 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App, enforcer: &focus
         "set_value" => {
             let e = &elem()?;
             if !ax::settable(e.0, "AXValue") {
+                if ax::attr_str(e.0, "AXRole").as_deref() == Some("AXPopUpButton") {
+                    return select_option(e, a["value"].as_str().unwrap_or(""));
+                }
                 return Err(server_err("Cannot set a value for an element that is not settable"));
             }
             // focusFieldIfNeeded: focus the field, clicking it when AXFocused does not take.
@@ -541,8 +634,10 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App, enforcer: &focus
                 return Err("pages must be > 0".into());
             }
             // One pixel scroll of pages x the element's extent at its center, as the original
-            // sends (it never uses the AX page actions).
-            let (_, _, w, h) = ax::frame(e.0).ok_or(server_err("element has no frame"))?;
+            // sends (it never uses the AX page actions). Unlike the original, a page is the
+            // visible extent: a web area's frame is the whole document, so 0.25 pages of a long
+            // page jumped a third of the way down.
+            let (_, _, w, h) = ax::visible_frame(e.0).or_else(|| ax::frame(e.0)).ok_or(server_err("element has no frame"))?;
             let px = |size: f64| (pages * size).round() as i32;
             let (dy, dx) = match dir {
                 "up" => (-px(h), 0),
@@ -551,6 +646,9 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App, enforcer: &focus
                 _ => (0, px(w)),
             };
             let at = ax::visible_center(e.0).map(|(x, y)| Pt { x, y }).map_or_else(|| center(e), Ok)?;
+            if !shown(at) && scroll_bar(e, dir, pages).is_some() {
+                return Ok(());
+            }
             cursor::move_to(at, snap.window_id);
             input::set_mouse_flags(0);
             input::scroll(at, dy, dx);
@@ -581,6 +679,123 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App, enforcer: &focus
         _ => return Err(format!("Unknown tool: {name}")),
     }
     Ok(())
+}
+
+/// A click where mouse events can't reach: off every display AppKit hit-tests them at the
+/// screen edge, and a sandboxed app's open panel (drawn by another process) ignores them. Not in
+/// the original: select a row (and open it on a double click), focus what takes focus, refuse
+/// the rest.
+fn without_mouse(e: &Cf, button: &str, count: i64, at: Pt, enforce: &dyn Fn() -> Result<(), String>) -> Result<(), String> {
+    if button != "left" {
+        visible(at)?;
+        return Err(server_err("Only left clicks work in this panel."));
+    }
+    let mut cur = Some(Cf(unsafe { core_foundation_sys::base::CFRetain(e.0) }));
+    for _ in 0..4 {
+        let Some(c) = cur else { break };
+        if ax::attr_str(c.0, "AXRole").as_deref() == Some("AXRow") && ax::settable(c.0, "AXSelected") {
+            ax::set_bool(c.0, "AXSelected", true).map_err(server_err)?;
+            // A click also moves focus to the list, so Return then opens the row.
+            if let Some(list) = ax::attr(c.0, "AXParent").filter(|l| ax::settable(l.0, "AXFocused")) {
+                let _ = ax::set_bool(list.0, "AXFocused", true);
+            }
+            if count >= 2 {
+                enforce()?;
+                input::press("Return").map_err(server_err)?;
+            }
+            return Ok(());
+        }
+        cur = ax::attr(c.0, "AXParent");
+    }
+    if count == 1 && ax::settable(e.0, "AXFocused") {
+        return ax::set_bool(e.0, "AXFocused", true).map_err(server_err);
+    }
+    if !shown(at) { return visible(at); }
+    Err(server_err("This window's content is drawn by another process (a sandboxed app's open or save panel), which ignores synthesized clicks. Click buttons by element_index, use set_value, or keys (super+shift+g, a path and Return picks a file)."))
+}
+
+/// Off every display AppKit drops a scroll wheel event (WebKit still takes it): move the
+/// enclosing scroll area's bar by the same number of pages instead. Not in the original.
+fn scroll_bar(e: &Cf, dir: &str, pages: f64) -> Option<()> {
+    let mut area = Cf(unsafe { core_foundation_sys::base::CFRetain(e.0) });
+    while ax::attr_str(area.0, "AXRole").as_deref() != Some("AXScrollArea") {
+        area = ax::attr(area.0, "AXParent")?;
+    }
+    let vertical = matches!(dir, "up" | "down");
+    let bar = ax::attr(area.0, if vertical { "AXVerticalScrollBar" } else { "AXHorizontalScrollBar" })?;
+    // The knob's share of the track is the share of the content in view.
+    let knob = kids(&bar, "AXValueIndicator").into_iter().next().and_then(|k| ax::frame(k.0))?;
+    let track = ax::frame(bar.0)?;
+    let seen = if vertical { knob.3 / track.3 } else { knob.2 / track.2 };
+    let sign = if matches!(dir, "up" | "left") { -1.0 } else { 1.0 };
+    let now = ax::attr(bar.0, "AXValue").and_then(|v| ax::number(v.0))?;
+    let to = (now + sign * pages * seen / (1.0 - seen).max(0.01)).clamp(0.0, 1.0);
+    let n = Cf(unsafe { core_foundation_sys::number::CFNumberCreate(std::ptr::null(), kCFNumberFloat64Type, &to as *const f64 as _) } as _);
+    ax::set_attr(bar.0, "AXValue", n.0).ok()
+}
+
+/// The menu items of a pop-up button's menu, open or not (web pop-ups list them while closed).
+fn options(popup: &Cf) -> Vec<Cf> {
+    kids(popup, "AXMenu").iter().flat_map(|m| kids(m, "AXMenuItem")).collect()
+}
+
+/// An element's children with the given role.
+fn kids(e: &Cf, role: &str) -> Vec<Cf> {
+    let Some(c) = ax::attr(e.0, "AXChildren") else { return Vec::new() };
+    ax::elements(&c).into_iter()
+        .filter(|&k| ax::attr_str(k, "AXRole").as_deref() == Some(role))
+        .map(|k| Cf(unsafe { core_foundation_sys::base::CFRetain(k) })).collect()
+}
+
+/// The pop-up button a menu item belongs to.
+fn popup_of(item: &Cf) -> Option<Cf> {
+    (ax::attr_str(item.0, "AXRole").as_deref() == Some("AXMenuItem")).then_some(())?;
+    let popup = ax::attr(ax::attr(item.0, "AXParent")?.0, "AXParent")?;
+    (ax::attr_str(popup.0, "AXRole").as_deref() == Some("AXPopUpButton")).then_some(popup)
+}
+
+/// After pressing `title` in a pop-up's menu: the pop-up shows it within a second, or this says
+/// the menu closed without choosing it (the original reports success either way).
+fn chosen(popup: &Cf, title: &str, before: Option<String>) -> Result<(), String> {
+    let start = std::time::Instant::now();
+    loop {
+        let now = ax::attr_str(popup.0, "AXValue");
+        if now.as_deref() == Some(title) || now != before { return Ok(()); }
+        if start.elapsed() > std::time::Duration::from_secs(1) {
+            return Err(server_err(format!("The menu closed without choosing \"{title}\": the pop-up button still shows \"{}\". Use set_value on the pop-up button with the option's text.", now.unwrap_or_default())));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// set_value on a pop-up button (a native <select>): open its menu if its options aren't
+/// listed, press the option with that title, and check the button shows it. Not in the
+/// original, which refuses pop-up buttons as not settable.
+fn select_option(popup: &Cf, want: &str) -> Result<(), String> {
+    let before = ax::attr_str(popup.0, "AXValue");
+    if before.as_deref() == Some(want) { return Ok(()); }
+    let mut items = options(popup);
+    if items.is_empty() {
+        let _ = ax::perform(popup.0, "AXPress");
+        for _ in 0..20 {
+            items = options(popup);
+            if !items.is_empty() { break; }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    let title = |e: &Cf| ax::attr_str(e.0, "AXTitle").unwrap_or_default();
+    let norm = |t: &str| t.trim().to_lowercase();
+    let item = items.iter().find(|e| title(e) == want).or_else(|| {
+        let near: Vec<&Cf> = items.iter().filter(|e| norm(&title(e)) == norm(want)).collect();
+        (near.len() == 1).then(|| near[0])
+    });
+    let Some(item) = item else {
+        for m in kids(popup, "AXMenu") { let _ = ax::perform(m.0, "AXCancel"); }
+        let names: Vec<String> = items.iter().map(|e| format!("\"{}\"", title(e))).filter(|t| t != "\"\"").collect();
+        return Err(server_err(format!("No option \"{want}\". The options are {}.", names.join(", "))));
+    };
+    ax::perform(item.0, "AXPress").map_err(server_err)?;
+    chosen(popup, &title(item), before)
 }
 
 /// The original's build number, which its state header reports.
@@ -704,7 +919,9 @@ fn render(app: &apps::App) -> Result<(ax::Tree, Cf), String> {
     Ok((tree, win))
 }
 
-const OFFSCREEN_NOTE: &str = "Note: This window is mostly outside every display (a window manager may have moved it off-screen), so the user can't see it right now. Actions still reach it.";
+const OFFSCREEN_NOTE: &str = "Note: This window is mostly outside every display (a window manager may have moved it off-screen), so the user can't see it right now. Element actions and keys reach it as usual; prefer them. Clicks at pixel positions fall back to accessibility (select a row, focus a field) and scrolls move the scroll bar, as a second choice.";
+
+const AEROSPACE_NOTE: &str = "AeroSpace is running, so it is likely on a hidden AeroSpace workspace. As a last resort, a pixel click the fallback can't do switches AeroSpace off for about a second, which briefly shows the user every hidden window.";
 
 const SPOTIFY_NOTE: &str = "Note: In order to be usable, Spotify app links must be rewritten as regular links (e.g. use open.spotify.com instead of xpui.app.spotify.com). Only use Spotify links that are written verbatim in the UI above. Note that IDs are only valid with their associated type (e.g. you cannot change an \"album\" URL to a \"track\" URL).";
 
@@ -726,7 +943,7 @@ fn instructions(app: &apps::App) -> Option<&'static str> {
 }
 
 /// get_app_state gets the full framing; actions get the shorter one.
-fn state(snaps: &mut HashMap<i32, Snapshot>, app: &apps::App, full: bool) -> Result<Value, String> {
+fn state(snaps: &mut HashMap<i32, Vec<Snapshot>>, app: &apps::App, full: bool) -> Result<Value, String> {
     let (tree, win) = render(app)?;
     let frame = ax::frame(win.0).ok_or(server_err("window has no frame"))?;
     // The AX window's own number; a frame match alone can pick a same-sized popup (Chrome's omnibox).
@@ -742,7 +959,8 @@ fn state(snaps: &mut HashMap<i32, Snapshot>, app: &apps::App, full: bool) -> Res
     // Not in the original: a window parked off-screen (another AeroSpace workspace, say) still
     // captures and takes actions, so nothing else tells the model the user can't see it.
     if on_display(frame) < 0.5 {
-        note += &format!("\n{OFFSCREEN_NOTE}\n");
+        let aero = if aerospace::running() { format!(" {AEROSPACE_NOTE}") } else { String::new() };
+        note += &format!("\n{OFFSCREEN_NOTE}{aero}\n");
     }
     let window = format!("Window: \"{title}\", App: {}.\n{}{note}", app.name, tree.text);
     let body = if full {
@@ -767,7 +985,9 @@ fn state(snaps: &mut HashMap<i32, Snapshot>, app: &apps::App, full: bool) -> Res
         }
         Some(Err(e)) => content.push(json!({"type": "text", "text": format!("Screenshot unavailable: {e}")})),
     }
-    snaps.insert(app.pid, Snapshot { taken: std::time::Instant::now(), tree, window: frame, window_id, image });
+    let history = snaps.entry(app.pid).or_default();
+    history.push(Snapshot { taken: std::time::Instant::now(), tree, window: frame, window_id, image });
+    if history.len() > 8 { history.remove(0); }
     Ok(Value::Array(content))
 }
 
@@ -809,6 +1029,37 @@ pub fn windows(pid: i32, on_screen: bool) -> Vec<(u32, (f64, f64, f64, f64))> {
             (num(d, "kCGWindowNumber") as u32, bounds)
         })
         .collect()
+}
+
+extern "C" {
+    fn responsibility_get_pid_responsible_for_pid(pid: i32) -> i32;
+}
+
+/// Where keys for `pid` must go. A sandboxed app's open and save panels (Safari's file upload,
+/// TextEdit's Open) are drawn by an XPC service the app is responsible for, in a hidden twin of
+/// the app's window. Keys posted to the app beep: AppKit only forwards real key events to the
+/// remote view. The original posts keys to that service as well (seen with an event tap).
+pub fn key_pid(pid: i32) -> i32 {
+    let Some(frame) = ax::window(ax::app_element(pid).0).and_then(|w| ax::frame(w.0)) else { return pid };
+    let same = |b: (f64, f64, f64, f64)| (b.0 - frame.0).abs() + (b.1 - frame.1).abs() + (b.2 - frame.2).abs() + (b.3 - frame.3).abs() < 2.0;
+    let list = Cf(unsafe { CGWindowListCopyWindowInfo(0, 0) } as _);
+    let num = |d: *const std::ffi::c_void, k: &str| {
+        let v = unsafe { CFDictionaryGetValue(d as _, ax::cfstr(k).0) };
+        let mut f = f64::NAN;
+        if !v.is_null() {
+            unsafe { CFNumberGetValue(v as _, kCFNumberFloat64Type, &mut f as *mut f64 as _) };
+        }
+        f
+    };
+    (0..unsafe { CFArrayGetCount(list.0 as _) })
+        .map(|i| unsafe { CFArrayGetValueAtIndex(list.0 as _, i) })
+        .filter(|&d| {
+            let b = unsafe { CFDictionaryGetValue(d as _, ax::cfstr("kCGWindowBounds").0) };
+            num(d, "kCGWindowLayer") == 0.0 && same((num(b, "X"), num(b, "Y"), num(b, "Width"), num(b, "Height")))
+        })
+        .map(|d| num(d, "kCGWindowOwnerPID") as i32)
+        .find(|&p| p != pid && unsafe { responsibility_get_pid_responsible_for_pid(p) } == pid)
+        .unwrap_or(pid)
 }
 
 /// The process owning a window.

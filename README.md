@@ -125,8 +125,14 @@ seconds. Your real pointer never moves.
 session. Safari is the agents' browser, left alone by the user, so logins made in
 it persist for later sessions. The session that opened the window gets it
 whenever it passes `app: "Safari"`; other sessions never see it and get another
-Safari window instead. It closes when the session ends. When AeroSpace runs, the
-window moves to a hidden workspace, `agents`, right after it opens.
+Safari window instead. It closes when the session ends or after 10 minutes
+unused, and a restarted service closes the ones an earlier one left open. When
+AeroSpace runs, the window moves to a hidden workspace, `agents`, right after it
+opens. Subagents share their parent's session, so each passes its own `name`
+and then uses `app: "Safari#<name>"`.
+
+Actions that load a page (Return, a submitted address bar, a followed link)
+answer with the loaded page, waiting up to 10 s for it.
 
 Safari has one key window, and keys go to it. Before each action the session's
 window is made key inside Safari, without activating Safari. Once the app has

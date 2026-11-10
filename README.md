@@ -126,7 +126,9 @@ session. Safari is the agents' browser, left alone by the user, so logins made i
 it persist for later sessions. The session that opened the window gets it
 whenever it passes `app: "Safari"`; other sessions never see it and get another
 Safari window instead. It closes when the session ends or after 10 minutes
-unused, and a restarted service closes the ones an earlier one left open. When
+unused, and a restarted service closes the ones an earlier one left open. A sheet
+left open on the window (a site asking for the location) is cancelled so the
+window can close, and a leave-this-page prompt is confirmed. When
 AeroSpace runs, the window moves to a hidden workspace, `agents`, right after it
 opens. Subagents share their parent's session, so each passes its own `name`
 and then uses `app: "Safari#<name>"`.
@@ -140,8 +142,12 @@ settled (it takes in queued keys only then), the first window no agent owns is
 made key again. Should the user be in Safari, that
 would pull their focus away (and AeroSpace would follow it to the hidden
 workspace), so then only actions that need no focus run: reading state, clicking
-elements by index, `set_value` and scroll. Keys, typing and mouse clicks ask the
-agent to wait.
+elements by index, `set_value` and scroll. An address bar is submitted with its
+accessibility action instead of Return, so navigating works too. Keys, typing,
+mouse clicks and other submitting fields ask the agent to wait.
+
+The user's own input to Safari (scrolling over their window, typing in it) never
+holds up a session working in its own window, which takes no user input.
 
 ## Known differences
 

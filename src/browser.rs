@@ -94,10 +94,19 @@ pub fn claim(pid: i32, window: u32) {
     }); });
 }
 
-/// Close a window with its close button, which needs no activation.
+/// Close a window with its close button, which needs no activation. A sheet left open (a site
+/// asking for the location) disables the button: it is cancelled first. A sheet the close
+/// itself brings up (leave this page?) is confirmed.
 fn close((pid, id): (i32, u32)) {
-    if let Some(button) = find(pid, id).and_then(|w| ax::attr(w.0, "AXCloseButton")) {
-        let _ = ax::perform(button.0, "AXPress");
+    let mut pressed = false;
+    for _ in 0..4 {
+        let Some(w) = find(pid, id) else { return };
+        let button = match ax::find_role(w.0, "AXSheet", 1) {
+            Some(sheet) => ax::attr(sheet.0, if pressed { "AXDefaultButton" } else { "AXCancelButton" }),
+            None => { pressed = true; ax::attr(w.0, "AXCloseButton") }
+        };
+        if let Some(b) = button { let _ = ax::perform(b.0, "AXPress"); }
+        std::thread::sleep(Duration::from_millis(300));
     }
 }
 

@@ -364,13 +364,14 @@ fn call(srv: &mut Server, name: &str, a: &Value) -> Result<Value, String> {
         return Ok(text(format!("Computer Use is not active for '{q}'. You first must call `get_app_state` to get the latest state before doing other Computer Use actions. If `get_app_state` is not available in your environment, use `tool_search` to surface it.")));
     };
     // Like the original, refuse to act while the user is using the app, and after they used it
-    // since the last get_app_state. Changes the app makes by itself don't count.
-    if let Some(t) = overlay::touched(app.pid) {
+    // since the last get_app_state. Changes the app makes by itself don't count. A session's own
+    // browser window never takes the user's input, so their use of the app doesn't matter there.
+    if let Some(t) = overlay::touched(app.pid).filter(|_| browser::mine(app.pid).is_none()) {
         let wait = USER_DEBOUNCE.saturating_sub(t.elapsed());
         if !wait.is_zero() {
             return Err(format!("The user is still interacting with '{}'. Wait {} seconds and retry.", app.name, wait.as_secs_f64().ceil()));
         }
-        if t > snap.taken && browser::mine(app.pid).is_none() {
+        if t > snap.taken {
             return Err(format!("The user changed '{}'. Re-query the latest state with `get_app_state` before sending more actions.", app.name));
         }
     }
@@ -463,7 +464,7 @@ thread_local! {
 
 fn hands_off(app: &apps::App) -> Result<(), String> {
     if !HANDS_OFF.with(|h| h.get()) { return Ok(()); }
-    Err(format!("The user is using {} right now, and this needs your window to take its keyboard focus, which would pull theirs away. Wait a few seconds and retry. Reading state, clicking elements by index, set_value and scroll work meanwhile.", app.name))
+    Err(format!("The user is using {} right now, and this needs your window to take its keyboard focus, which would pull theirs away. Wait a few seconds and retry. Reading state, scrolling, clicking elements by index and set_value in the address bar work meanwhile.", app.name))
 }
 
 /// open_browser_window: a new Safari window (the agents' browser, so logins persist), made
@@ -746,6 +747,11 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App, enforcer: &focus
                 && (ax::set_bool(e.0, "AXFocused", true).is_err() || !ax::attr(e.0, "AXFocused").is_some_and(|v| ax::to_bool(v.0))) {
                 act(snap, "click", &json!({"element_index": index}), app, enforcer)?;
             }
+            // Safari's address bar submits through its action, which needs no keyboard focus, so
+            // it works while the user is in Safari. Not in the original.
+            let confirms = ax::attr_str(e.0, "AXIdentifier").as_deref() == Some("WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD")
+                && ax::actions(e.0).iter().any(|a| a.0 == "AXConfirm");
+            if submits(e) && !confirms { hands_off(app)?; }
             let value = a["value"].as_str().unwrap_or("");
             let named = ax::file_name(e.0).filter(|_| ax::lists(e.0, "AXFilename"));
             ax::set_attr(e.0, "AXValue", ax::cfstr(value).0).map_err(server_err)?;
@@ -762,7 +768,9 @@ fn act(snap: &Snapshot, name: &str, a: &Value, app: &apps::App, enforcer: &focus
                 }
             }
             // Search fields and address bars are submitted with Return, as the original does.
-            if submits(e) {
+            if confirms {
+                ax::perform(e.0, "AXConfirm").map_err(server_err)?;
+            } else if submits(e) {
                 enforce()?;
                 input::press("Return").map_err(|k| server_err(format!("keyNotFound(\"{k}\")")))?;
             }

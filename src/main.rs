@@ -334,9 +334,6 @@ fn screen_locked() -> bool {
 
 fn call(srv: &mut Server, name: &str, a: &Value) -> Result<Value, String> {
     validate(name, a)?;
-    if overlay::stopped() {
-        return Ok(text("This application session has been explicitly stopped by the user for this turn. Stop your work and send a final message noting they stopped the session and you're ready to continue if they want you to. Computer Use can be used again in the next assistant turn."));
-    }
     if name == "list_apps" {
         return Ok(text(apps::list()));
     }

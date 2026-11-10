@@ -71,8 +71,9 @@ seconds. Your real pointer never moves.
 
 - **Any app, no prompts.** Every app is allowed without asking, and nothing is
   blocked. Terminals, password managers and browsers are all fair game.
-- **Esc stops the agent.** Every further call returns the original's "stopped by
-  the user" message, until the agent has been idle for 30 seconds.
+- **Esc doesn't stop the agent.** The original stops every session when Esc is
+  pressed anywhere during one, so an Esc meant for another app stopped agents
+  working in parallel. This one never stops on a key.
 - **Locked screen.** Nothing is read while the Mac is locked.
 
 ## How it works

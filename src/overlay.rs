@@ -1,5 +1,6 @@
-//! The AppKit side of the session: the main-thread run loop, Esc to stop the agent, and the
-//! user's own input to the apps it controls, like the original's overlay.
+//! The AppKit side of the session: the main-thread run loop and the user's own input to the
+//! apps it controls, like the original's overlay. Unlike the original, Esc never stops the
+//! agent: an Esc meant for any other app would stop every agent session at once.
 use block2::RcBlock;
 use objc2::MainThreadMarker;
 use objc2_app_kit::*;
@@ -9,14 +10,10 @@ use std::sync::Mutex;
 extern "C" {
     fn CGEventGetIntegerValueField(e: *const std::ffi::c_void, field: u32) -> i64;
 }
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-/// Last agent action, and when the user pressed Esc during a session.
-static ACTIVE: Mutex<Option<Instant>> = Mutex::new(None);
-static STOPPED: Mutex<Option<Instant>> = Mutex::new(None);
 /// The user's last key press, click or scroll per app (pid).
 static TOUCHED: Mutex<Vec<(i32, Instant)>> = Mutex::new(Vec::new());
-const SESSION_IDLE: Duration = Duration::from_secs(30);
 
 /// Run AppKit on the main thread (never returns); `work` runs the MCP loop on another thread.
 pub fn run(work: impl FnOnce() + Send + 'static) -> ! {
@@ -30,11 +27,6 @@ pub fn run(work: impl FnOnce() + Send + 'static) -> ! {
         let cg: *const std::ffi::c_void = unsafe { objc2::msg_send![e, CGEvent] };
         if !cg.is_null() && unsafe { CGEventGetIntegerValueField(cg, 41) } == std::process::id() as i64 {
             return;
-        }
-        let recent = ACTIVE.lock().unwrap().is_some_and(|t| t.elapsed() < SESSION_IDLE);
-        if key && e.keyCode() == 53 && recent {
-            *STOPPED.lock().unwrap() = Some(Instant::now());
-            crate::cursor::hide();
         }
         // Keys go to the frontmost app, pointer events to the app owning the window under them.
         let pid = if key { crate::apps::frontmost() } else { crate::window_owner(e.windowNumber() as u32) };
@@ -55,17 +47,6 @@ pub fn run(work: impl FnOnce() + Send + 'static) -> ! {
     });
     app.run();
     std::process::exit(0)
-}
-
-/// True once the user pressed Esc, until the agent has been idle for a whole turn.
-pub fn stopped() -> bool {
-    let mut s = STOPPED.lock().unwrap();
-    let idle = ACTIVE.lock().unwrap().is_none_or(|t| t.elapsed() >= SESSION_IDLE);
-    if idle {
-        *s = None;
-    }
-    *ACTIVE.lock().unwrap() = Some(Instant::now());
-    s.is_some()
 }
 
 /// When the user last pressed a key, clicked or scrolled in the app.

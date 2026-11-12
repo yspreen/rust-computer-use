@@ -38,6 +38,7 @@ pub fn command(args: &[&str]) -> bool {
 
 /// Move a window to a workspace without following it. A config rule for new windows
 /// (on-window-detected) can move it back once AeroSpace registers it, so this checks for 2 s.
+/// The workspace gets accordion layout, so windows keep their size as others come and go.
 pub fn park(window: u32, workspace: &str) {
     let id = window.to_string();
     let there = || run(&["list-windows", "--workspace", workspace, "--format", "%{window-id}"])
@@ -45,9 +46,10 @@ pub fn park(window: u32, workspace: &str) {
     let mut held = 0;
     for _ in 0..20 {
         if there() { held += 1; } else { held = 0; command(&["move-node-to-workspace", "--window-id", &id, workspace]); }
-        if held == 3 { return; }
+        if held == 3 { break; }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+    command(&["layout", "--workspace", workspace, "--root", "h_accordion"]);
 }
 
 /// Turn window management off (every hidden window comes on screen) or back on (they return

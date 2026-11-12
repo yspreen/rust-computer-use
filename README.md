@@ -131,7 +131,8 @@ unused, and a restarted service closes the ones an earlier one left open. A shee
 left open on the window (a site asking for the location) is cancelled so the
 window can close, and a leave-this-page prompt is confirmed. When
 AeroSpace runs, the window moves to a hidden workspace, `agents`, right after it
-opens. Subagents share their parent's session, so each passes its own `name`
+opens. That workspace is set to accordion layout, so windows keep their size as
+agents come and go. Subagents share their parent's session, so each passes its own `name`
 and then uses `app: "Safari#<name>"`.
 
 Actions that load a page (Return, a submitted address bar, a followed link)
